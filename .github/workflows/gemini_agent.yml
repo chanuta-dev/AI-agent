@@ -14,6 +14,7 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      workflows: write   # מאפשר לבוט לשדרג גם את קובצי ה-Actions של עצמו!
 
     steps:
       - name: Checkout Repository

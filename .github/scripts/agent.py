@@ -8,12 +8,6 @@ import time
 
 MODEL_NAME = "gemini-3.7-flash"
 
-# מודלים נתמכים ומהירים ב-Groq לגיבוי מיידי
-GROQ_CANDIDATE_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant"
-]
-
 def github_api_request(url, token, data=None, method="GET"):
     """ביצוע קריאות ישירות ל-GitHub REST API ללא צורך בספריות חיצוניות."""
     headers = {
@@ -72,8 +66,32 @@ def call_gemini_api(api_key, contents, system_instruction):
         raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
         return json.loads(raw_text)
 
+def get_best_groq_model(groq_key):
+    """שולף דינמית את רשימת המודלים הפעילים כרגע ב-Groq כדי למנוע 404."""
+    url = "https://api.groq.com/openai/v1/models"
+    headers = {
+        'Authorization': f'Bearer {groq_key.strip()}',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            models = [m['id'] for m in data.get('data', []) if not m['id'].startswith('whisper')]
+            if models:
+                for preferred in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound-mini", "qwen/qwen3.6-27b", "llama-3.3-70b-versatile"]:
+                    if preferred in models:
+                        return preferred
+                return models[0]
+    except Exception as e:
+        print(f"⚠️ Groq dynamic models fetch error: {e}")
+    return "openai/gpt-oss-120b"
+
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי ל-Groq עם מעבר אוטומטי בין מודלים."""
+    """קריאת גיבוי ל-Groq עם מודל דינמי ומוכח."""
+    chosen_model = get_best_groq_model(groq_key)
+    print(f"🎯 מודל Groq שנבחר: {chosen_model}")
+
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
     for c in contents:
@@ -86,35 +104,25 @@ def call_groq_api(groq_key, contents, system_instruction):
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
-    last_groq_error = None
-    for model in GROQ_CANDIDATE_MODELS:
-        try:
-            print(f"🔄 מנסה מודל Groq: {model}...")
-            payload = {
-                "model": model,
-                "messages": messages,
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2
-            }
-            data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(url, data=data, headers=headers)
-            
-            with urllib.request.urlopen(req, timeout=25) as response:
-                res_data = json.loads(response.read().decode())
-                raw_text = res_data['choices'][0]['message']['content']
-                print(f"✅ הצלחה עם מודל Groq: {model}")
-                return model, json.loads(raw_text)
-        except Exception as e:
-            print(f"⚠️ Groq ({model}) נכשל: {e}")
-            last_groq_error = e
-
-    raise RuntimeError(f"כל מודלי Groq נכשלו: {last_groq_error}")
+    payload = {
+        "model": chosen_model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2
+    }
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers=headers)
+    
+    with urllib.request.urlopen(req, timeout=25) as response:
+        res_data = json.loads(response.read().decode())
+        raw_text = res_data['choices'][0]['message']['content']
+        return chosen_model, json.loads(raw_text)
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון Failover שמחליף מפתחות וספקים במהירות בעת עומס."""
+    """מנגנון Failover מלא."""
     last_error = None
 
-    # 1. ניסיון מול מפתחות Gemini
+    # 1. ניסיון מול מפתחות Gemini 3.7
     for i, key in enumerate(gemini_keys):
         if not key:
             continue
@@ -128,11 +136,13 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
             err_body = e.read().decode()
             print(f"⚠️ מפתח #{i + 1} נכשל עם שגיאה {status}")
             last_error = f"Gemini HTTP {status}"
+
+            # אם חסימת קצב רגעית – המתנה של שניות ספורות
             if status == 429:
                 match = re.search(r'retry in (\d+(\.\d+)?)s', err_body)
                 if match:
                     wait_sec = float(match.group(1)) + 1.0
-                    if wait_sec <= 10:
+                    if wait_sec <= 20 and not groq_key:
                         print(f"⏳ ממתין {wait_sec:.1f} שניות להתאוששות מכסת Gemini...")
                         time.sleep(wait_sec)
                         try:
@@ -147,8 +157,9 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
     # 2. גיבוי מיידי Groq
     if groq_key:
         try:
-            print("⚡ Gemini עמוס, מפעיל גיבוי Groq...")
+            print("⚡ מפתחות גוגל עמוסים, מפעיל גיבוי Groq...")
             used_model, result = call_groq_api(groq_key, contents, system_instruction)
+            print(f"✅ הצלחה עם Groq ({used_model})!")
             return f"Groq ({used_model})", result
         except Exception as e:
             print(f"⚠️ שגיאה ב-Groq: {e}")
@@ -174,7 +185,7 @@ def main():
     repo_name = os.environ["REPO_NAME"]
     issue_number = int(os.environ["ISSUE_NUMBER"])
 
-    # טעינת נתוני Issue ותגובות
+    # טעינת נתוני Issue ותגובות ישירות דרך REST
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
@@ -259,7 +270,7 @@ def main():
             subprocess.run(["git", "config", "--global", "user.email", "gemini-bot@github.com"], check=True)
             subprocess.run(["git", "commit", "-m", response_data.get("commit_message", "AI auto-update")], check=True)
             
-            # אימות ודחיפה באמצעות Access Token ישירות
+            # דחיפה מאובטחת עם x-access-token
             remote_url = f"https://x-access-token:{github_token}@github.com/{repo_name}.git"
             subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True)
             subprocess.run(["git", "push", "origin", branch, "--force"], check=True)

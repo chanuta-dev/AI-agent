@@ -52,8 +52,8 @@ def call_gemini_api(api_key, contents, system_instruction):
         raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
         return json.loads(raw_text)
 
-def call_groq_fallback(groq_key, contents, system_instruction):
-    """קריאת גיבוי אופציונלית ל-Groq (Llama 3.3 70B)."""
+def call_groq_api(groq_key, contents, system_instruction):
+    """קריאת גיבוי ל-Groq עם כותרות מלאות למניעת 403."""
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
     for c in contents:
@@ -67,10 +67,15 @@ def call_groq_fallback(groq_key, contents, system_instruction):
         "temperature": 0.2
     }
     data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(url, data=data, headers={
+    
+    # הוספת User-Agent תקין למניעת חסימת Cloudflare (403 Forbidden)
+    headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {groq_key}'
-    })
+        'Authorization': f'Bearer {groq_key.strip()}',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    req = urllib.request.Request(url, data=data, headers=headers)
     
     with urllib.request.urlopen(req, timeout=30) as response:
         res_data = json.loads(response.read().decode())

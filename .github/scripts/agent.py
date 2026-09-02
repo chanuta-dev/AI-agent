@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import urllib.request
 import urllib.error
@@ -7,6 +8,13 @@ import time
 from github import Github, Auth
 
 MODEL_NAME = "gemini-3.7-flash"
+
+# מודלים מובילים ב-Groq לגיבוי
+GROQ_CANDIDATE_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b"
+]
 
 def get_repo_files_and_content():
     """סורק את כל קבצי הפרויקט וטוען את תוכנם לקונטקסט."""
@@ -53,36 +61,48 @@ def call_gemini_api(api_key, contents, system_instruction):
         return json.loads(raw_text)
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי ל-Groq."""
+    """קריאת גיבוי ל-Groq עם מעבר אוטומטי בין מודלים."""
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
     for c in contents:
         role = "assistant" if c["role"] == "model" else "user"
         messages.append({"role": role, "content": c["parts"][0]["text"]})
         
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": messages,
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2
-    }
-    data = json.dumps(payload).encode('utf-8')
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {groq_key.strip()}',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
-    req = urllib.request.Request(url, data=data, headers=headers)
-    
-    with urllib.request.urlopen(req, timeout=30) as response:
-        res_data = json.loads(response.read().decode())
-        raw_text = res_data['choices'][0]['message']['content']
-        return json.loads(raw_text)
+
+    last_groq_error = None
+    for model in GROQ_CANDIDATE_MODELS:
+        try:
+            print(f"🔄 מנסה מודל Groq: {model}...")
+            payload = {
+                "model": model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2
+            }
+            data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(url, data=data, headers=headers)
+            
+            with urllib.request.urlopen(req, timeout=30) as response:
+                res_data = json.loads(response.read().decode())
+                raw_text = res_data['choices'][0]['message']['content']
+                print(f"✅ הצלחה עם מודל Groq: {model}")
+                return model, json.loads(raw_text)
+        except Exception as e:
+            print(f"⚠️ Groq ({model}) נכשל: {e}")
+            last_groq_error = e
+
+    raise RuntimeError(f"כל מודלי Groq נכשלו: {last_groq_error}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
     """מנגנון Failover שמחליף מפתחות וספקים ברגע של 429 או 503."""
     last_error = None
 
+    # 1. ניסיון מול מפתחות Gemini 3.7
     for i, key in enumerate(gemini_keys):
         if not key:
             continue
@@ -94,19 +114,34 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
         except urllib.error.HTTPError as e:
             status = e.code
             err_body = e.read().decode()
-            print(f"⚠️ מפתח #{i + 1} נכשל עם שגיאה {status}: {err_body}")
+            print(f"⚠️ מפתח #{i + 1} נכשל עם שגיאה {status}")
             last_error = f"Gemini Error {status}"
+
+            # אם יש הגבלת קצב של שניות בודדות - נמתין וננסה שוב
+            if status == 429:
+                match = re.search(r'retry in (\d+(\.\d+)?)s', err_body)
+                if match:
+                    wait_sec = float(match.group(1)) + 1.5
+                    if wait_sec <= 25:
+                        print(f"⏳ ממתין {wait_sec:.1f} שניות להתאוששות מכסת Gemini...")
+                        time.sleep(wait_sec)
+                        try:
+                            result = call_gemini_api(key, contents, system_instruction)
+                            print(f"✅ הצלחה עם Gemini 3.7 (מפתח #{i + 1}) לאחר המתנה!")
+                            return "Gemini 3.7", result
+                        except Exception:
+                            pass
             continue
         except Exception as e:
             last_error = str(e)
             time.sleep(1)
 
+    # 2. גיבוי Groq
     if groq_key:
         try:
             print("⚡ מפתחות גוגל עמוסים, מפעיל גיבוי Groq...")
-            result = call_groq_api(groq_key, contents, system_instruction)
-            print("✅ הצלחה עם Groq!")
-            return "Groq Backup", result
+            used_model, result = call_groq_api(groq_key, contents, system_instruction)
+            return f"Groq ({used_model})", result
         except Exception as e:
             print(f"⚠️ שגיאה ב-Groq: {e}")
             last_error = f"Groq Error: {e}"
@@ -145,7 +180,7 @@ def main():
         role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
         conversation.append({"role": role, "parts": [{"text": comment.body or ""}]})
 
-    # 3. הנחיית מערכת משודרגת
+    # 3. הנחיות מערכת
     system_instruction = """
     You are an autonomous AI software engineer operating inside this GitHub repository.
     You communicate naturally, clearly, and helpfully in Hebrew.
@@ -154,7 +189,7 @@ def main():
     1. ALWAYS return a VALID JSON object (no markdown code blocks around the JSON).
     2. GitHub security prevents automated bots from pushing commits to `.github/workflows/`.
        - NEVER include files starting with `.github/workflows/` in `files_to_update`.
-       - If you recommend or design optimizations/changes for `.github/workflows/` (e.g. `gemini_agent.yml`), explain them clearly inside `chat_response` and provide the exact YAML code block for the user to copy-paste manually!
+       - If you recommend optimizations for `.github/workflows/`, explain them in `chat_response` and provide the exact YAML snippet for the user.
        - You CAN modify `.github/scripts/agent.py` and ALL application files directly via `files_to_update`.
     
     IF CHATTING / EXPLAINING / BRAINSTORMING:
@@ -195,7 +230,6 @@ def main():
             branch = response_data.get("branch_name", f"ai-patch-issue-{issue_number}")
             subprocess.run(["git", "checkout", "-B", branch], check=True)
             
-            # סינון בטיחותי - קבצים שמותר לדחוף
             valid_files = [f for f in response_data.get("files_to_update", []) if not f["path"].startswith(".github/workflows/")]
             
             for item in valid_files:

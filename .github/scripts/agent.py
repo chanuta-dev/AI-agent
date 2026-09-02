@@ -1,12 +1,20 @@
 import os
 import json
+import time
 import subprocess
 from google import genai
 from google.genai import types
 from github import Github, Auth
 
+# רשימת מודלים חלופיים במקרה של עומס או ניתוק
+CANDIDATE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-pro"
+]
+
 def get_repo_structure():
-    """סורק את מבנה הפרויקט הקיים כדי ש-Gemini יכיר את כל הקבצים."""
+    """סורק את מבנה הפרויקט הקיים."""
     tree = []
     for root, dirs, files in os.walk("."):
         if ".git" in root or "__pycache__" in root:
@@ -15,8 +23,37 @@ def get_repo_structure():
             tree.append(os.path.normpath(os.path.join(root, f)))
     return tree
 
+def run_chat_with_retry(client, history_contents, latest_message, system_instruction):
+    """מריץ את הצ'אט באמצעות client.chats.create עם ניסיונות חוזרים ומעבר בין מודלים."""
+    last_error = None
+
+    for model_name in CANDIDATE_MODELS:
+        for attempt in range(2): # 2 ניסיונות לכל מודל במקרה של ניתוק רשת
+            try:
+                print(f"🔄 מנסה מודל {model_name} (ניסיון {attempt + 1})...")
+                
+                chat = client.chats.create(
+                    model=model_name,
+                    history=history_contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.2
+                    )
+                )
+                
+                response = chat.send_message(latest_message)
+                print(f"✅ הצלחה עם {model_name}!")
+                return response.text.strip()
+
+            except Exception as e:
+                print(f"⚠️ שגיאה עם {model_name}: {str(e)}")
+                last_error = e
+                time.sleep(2) # המתנה של 2 שניות לפני ניסיון נוסף
+
+    raise RuntimeError(f"כל הניסיונות נכשלו: {last_error}")
+
 def main():
-    # 1. אתחול גישה ל-GitHub ול-Gemini
+    # 1. אתחול משתני סביבה והתחברות
     github_token = os.environ["GITHUB_TOKEN"]
     gemini_api_key = os.environ["GEMINI_API_KEY"]
     repo_name = os.environ["REPO_NAME"]
@@ -28,32 +65,42 @@ def main():
     issue = repo.get_issue(issue_number)
     client = genai.Client(api_key=gemini_api_key)
 
-    # 2. בניית היסטוריית השיחה מתוך ה-Issue באמצעות types.Content
-    conversation = []
-    
-    # מידע מקדים ל-AI על מצב הקבצים הנוכחי
+    # 2. איסוף היסטוריית השיחה מתוך ה-Issue
     files_list = get_repo_structure()
     context_prefix = f"[System Context: Existing project files: {json.dumps(files_list)}]\n\n"
     
-    first_message = context_prefix + f"Issue #{issue.number} Title: {issue.title}\n\n{issue.body or ''}"
-    conversation.append(
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=first_message)]
-        )
-    )
+    initial_user_msg = context_prefix + f"Issue #{issue.number} Title: {issue.title}\n\n{issue.body or ''}"
     
-    for comment in issue.get_comments():
-        # זיהוי אם התגובה היא של המשתמש או של הבוט
-        role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
-        conversation.append(
+    all_comments = list(issue.get_comments())
+    
+    # בניית היסטוריית ההודעות הקודמות (אם יש)
+    history_contents = []
+    
+    if all_comments:
+        # יש כבר תגובות קודמות - ההודעה הראשונה נכנסת להיסטוריה
+        history_contents.append(
             types.Content(
-                role=role,
-                parts=[types.Part.from_text(text=comment.body or "")]
+                role="user",
+                parts=[types.Part.from_text(text=initial_user_msg)]
             )
         )
+        # כל התגובות עד לפני האחרונה נכנסות להיסטוריה
+        for comment in all_comments[:-1]:
+            role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
+            history_contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=comment.body or "")]
+                )
+            )
+        # התגובה האחרונה היא ההודעה הנוכחית
+        last_comment = all_comments[-1]
+        latest_message = last_comment.body or ""
+    else:
+        # פתיחת Issue חדש ללא תגובות עדיין
+        latest_message = initial_user_msg
 
-    # 3. הנחיית מערכת (System Instruction)
+    # 3. הנחיות מערכת (System Instruction)
     system_instruction = """
     You are Gemini, an autonomous and self-upgrading software engineer operating directly inside a GitHub repository.
     
@@ -80,19 +127,14 @@ def main():
       }
     """
 
-    # 4. קריאה ל-Gemini
-    response = client.models.generate_content(
-        model='gemini-3.7-flash',
-        contents=conversation,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.2
-        )
-    )
+    # 4. שליחת הבקשה לצ'אט
+    try:
+        resp_text = run_chat_with_retry(client, history_contents, latest_message, system_instruction)
+    except Exception as e:
+        issue.create_comment(f"⚠️ חלה בעיית תקשורת זמנית עם שרתי Gemini: {str(e)}")
+        return
 
-    resp_text = response.text.strip()
-
-    # 5. ניקוי עטיפות Markdown אם המודל הוסיף בטעות
+    # 5. ניקוי עטיפות Markdown במידה ויש
     clean_json_str = resp_text
     if clean_json_str.startswith("```json"):
         clean_json_str = clean_json_str[7:]
@@ -102,7 +144,7 @@ def main():
         clean_json_str = clean_json_str[:-3]
     clean_json_str = clean_json_str.strip()
 
-    # 6. בדיקה האם המשתמש אישר ביצוע (Commit)
+    # 6. בדיקה האם יש פקודת Commit
     if clean_json_str.startswith("{") and '"action": "commit"' in clean_json_str:
         try:
             data = json.loads(clean_json_str)
@@ -111,7 +153,7 @@ def main():
             # יצירת Branch
             subprocess.run(["git", "checkout", "-B", branch], check=True)
             
-            # כתיבה ועדכון קבצים
+            # כתיבת קבצים
             for item in data.get("files_to_update", []):
                 filepath = item["path"]
                 os.makedirs(os.path.dirname(filepath), exist_ok=True) if os.path.dirname(filepath) else None
@@ -149,7 +191,7 @@ def main():
             issue.create_comment(f"⚠️ חלה שגיאה בביצוע הקומיט: {str(e)}\n\nטקסט מהמודל:\n{resp_text}")
             return
 
-    # תגובת צ'אט רגילה
+    # תגובת צ'אט רגילה ב-Issue
     issue.create_comment(resp_text)
 
 if __name__ == "__main__":

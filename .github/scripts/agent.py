@@ -3,7 +3,11 @@ import json
 import subprocess
 import urllib.request
 import urllib.error
+import time
 from github import Github, Auth
+
+# נעילה מוחלטת על המודל החכם והעדכני ביותר!
+MODEL_NAME = "gemini-3.7-flash"
 
 def get_repo_structure():
     """סורק את מבנה הפרויקט הקיים."""
@@ -15,34 +19,9 @@ def get_repo_structure():
             tree.append(os.path.normpath(os.path.join(root, f)))
     return tree
 
-def get_best_model(api_key):
-    """שולף דינמית את מודל ה-Flash העדכני ביותר (בדיוק כמו בפרויקט ה-JS שלך)."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req) as response:
-            res_data = json.loads(response.read().decode())
-            # מסנן רק מודלים מסוג Flash שתומכים בטקסט רגיל (ללא Live או אקספרימנטליים)
-            flash_models = [
-                m['name'].replace('models/', '') for m in res_data.get('models', [])
-                if 'flash' in m['name'].lower()
-                and 'exp' not in m['name'].lower()
-                and 'live' not in m['name'].lower()
-                and 'generateContent' in m.get('supportedGenerationMethods', [])
-            ]
-            if flash_models:
-                chosen = flash_models[-1]
-                print(f"🎯 Dynamic Model Selected: {chosen}")
-                return chosen
-    except Exception as e:
-        print(f"⚠️ Could not fetch models dynamically: {e}")
-    
-    # ברירת מחדל אמינה ויציבה למקרה שאין אינטרנט או שהחיפוש נכשל
-    return "gemini-3.7-flash"
-
-def generate_content_rest(api_key, model_name, contents, system_instruction):
-    """קריאה ישירה ונקייה ל-API של גוגל (המקבילה המדויקת ל-fetch שלך)."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+def generate_content_rest(api_key, contents, system_instruction):
+    """קריאה ישירה ונקייה ל-API של גוגל (המקבילה המדויקת ל-fetch מ-JS)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
     
     payload = {
         "systemInstruction": {
@@ -50,7 +29,7 @@ def generate_content_rest(api_key, model_name, contents, system_instruction):
         },
         "contents": contents,
         "generationConfig": {
-            "responseMimeType": "application/json", # מכריח קבלת JSON טהור!
+            "responseMimeType": "application/json", # מבטיח תמיד קבלת JSON טהור
             "temperature": 0.2
         }
     }
@@ -79,10 +58,7 @@ def main():
     repo = gh.get_repo(repo_name)
     issue = repo.get_issue(issue_number)
 
-    # 2. בחירת המודל
-    selected_model = get_best_model(gemini_api_key)
-
-    # 3. בניית היסטוריית השיחה מה-Issue במבנה של REST API
+    # 2. בניית היסטוריית השיחה מה-Issue
     files_list = get_repo_structure()
     context_prefix = f"[System Context: Existing project files: {json.dumps(files_list)}]\n\n"
     
@@ -96,7 +72,7 @@ def main():
         role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
         conversation.append({"role": role, "parts": [{"text": comment.body or ""}]})
 
-    # 4. הנחיית מערכת שתמיד דורשת JSON (אבל המשתמש לא יראה אותו)
+    # 3. הנחיית מערכת שתמיד דורשת JSON 
     system_instruction = """
     You are an autonomous software engineer operating inside a GitHub repository.
     You communicate naturally in Hebrew.
@@ -125,17 +101,23 @@ def main():
     }
     """
 
-    # 5. ביצוע הקריאה (REST API)
-    try:
-        response_data = generate_content_rest(gemini_api_key, selected_model, conversation, system_instruction)
-    except Exception as e:
-        issue.create_comment(f"⚠️ חלה שגיאת תקשורת מול המודל ({selected_model}): {str(e)}")
-        return
+    # 4. ביצוע הקריאה עם מנגנון Retry במקרה של עומס רגעי
+    response_data = None
+    for attempt in range(3):
+        try:
+            response_data = generate_content_rest(gemini_api_key, conversation, system_instruction)
+            break
+        except Exception as e:
+            if attempt == 2:
+                issue.create_comment(f"⚠️ חלה שגיאת תקשורת מול המודל ({MODEL_NAME}): {str(e)}")
+                return
+            time.sleep(2.5) # המתנה של 2.5 שניות לפני ניסיון חוזר
 
+    # 5. חילוץ התשובה
     action = response_data.get("action", "chat")
     chat_reply = response_data.get("chat_response", "אני כאן כדי לעזור!")
 
-    # 6. טיפול בפעולה
+    # 6. טיפול בפעולה (Push לקוד או שיחה)
     if action == "commit":
         try:
             branch = response_data.get("branch_name", f"ai-patch-issue-{issue_number}")
@@ -144,7 +126,8 @@ def main():
             
             for item in response_data.get("files_to_update", []):
                 filepath = item["path"]
-                os.makedirs(os.path.dirname(filepath), exist_ok=True) if os.path.dirname(filepath) else None
+                if os.path.dirname(filepath):
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(item["content"])
                 subprocess.run(["git", "add", filepath], check=True)
@@ -168,13 +151,13 @@ def main():
             except Exception:
                 pr_url = f"https://github.com/{repo_name}/tree/{branch}"
 
-            summary = f"✨ **בוצע בהצלחה (באמצעות {selected_model})!**\n\n{chat_reply}\n\n🔗 **Pull Request מוכן:** {pr_url}"
+            summary = f"✨ **בוצע בהצלחה (באמצעות {MODEL_NAME})!**\n\n{chat_reply}\n\n🔗 **Pull Request מוכן:** {pr_url}"
             issue.create_comment(summary)
 
         except Exception as e:
             issue.create_comment(f"⚠️ חלה שגיאה בביצוע ה-Commit: {str(e)}")
     else:
-        # בשיחה רגילה - המשתמש מקבל רק את הטקסט!
+        # בשיחה רגילה - המשתמש מקבל רק את הטקסט הטבעי!
         issue.create_comment(chat_reply)
 
 if __name__ == "__main__":

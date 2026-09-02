@@ -9,7 +9,7 @@ from github import Github, Auth
 MODEL_NAME = "gemini-3.7-flash"
 
 def get_repo_files_and_content():
-    """סורק את כל קבצי הפרויקט (כולל .github) וטוען את תוכנם לקונטקסט."""
+    """סורק את כל קבצי הפרויקט וטוען את תוכנם לקונטקסט."""
     repo_files = {}
     file_list = []
     
@@ -34,7 +34,7 @@ def get_repo_files_and_content():
     return file_list, repo_files
 
 def call_gemini_api(api_key, contents, system_instruction):
-    """קריאה ישירה ל-Gemini 3.7 Flash."""
+    """קריאה ישירה ל-Gemini 3.7."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
@@ -47,13 +47,13 @@ def call_gemini_api(api_key, contents, system_instruction):
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=35) as response:
         res_data = json.loads(response.read().decode())
         raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
         return json.loads(raw_text)
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי ל-Groq עם כותרות מלאות למניעת 403."""
+    """קריאת גיבוי ל-Groq."""
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
     for c in contents:
@@ -67,14 +67,11 @@ def call_groq_api(groq_key, contents, system_instruction):
         "temperature": 0.2
     }
     data = json.dumps(payload).encode('utf-8')
-    
-    # הוספת User-Agent תקין למניעת חסימת Cloudflare (403 Forbidden)
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {groq_key.strip()}',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
-    
     req = urllib.request.Request(url, data=data, headers=headers)
     
     with urllib.request.urlopen(req, timeout=30) as response:
@@ -82,11 +79,10 @@ def call_groq_api(groq_key, contents, system_instruction):
         raw_text = res_data['choices'][0]['message']['content']
         return json.loads(raw_text)
 
-def generate_with_failover(gemini_keys, groq_key, contents, system_instruction):
+def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
     """מנגנון Failover שמחליף מפתחות וספקים ברגע של 429 או 503."""
     last_error = None
 
-    # 1. ניסיון מול מפתחות ה-Gemini 3.7 שהוגדרו
     for i, key in enumerate(gemini_keys):
         if not key:
             continue
@@ -97,30 +93,28 @@ def generate_with_failover(gemini_keys, groq_key, contents, system_instruction):
             return "Gemini 3.7", result
         except urllib.error.HTTPError as e:
             status = e.code
-            err_msg = e.read().decode()
-            print(f"⚠️ מפתח #{i + 1} נכשל עם שגיאה {status}: {err_msg}")
-            last_error = f"Gemini HTTP {status}"
-            if status in [429, 503, 500]:
-                continue # עובר למפתח הבא
-            raise e
+            err_body = e.read().decode()
+            print(f"⚠️ מפתח #{i + 1} נכשל עם שגיאה {status}: {err_body}")
+            last_error = f"Gemini Error {status}"
+            continue
         except Exception as e:
             last_error = str(e)
+            time.sleep(1)
 
-    # 2. גיבוי אחרון ל-Groq (אם הוגדר מפתח GROQ_API_KEY)
     if groq_key:
         try:
-            print("🔄 כל מפתחות גוגל עמוסים, עובר לגיבוי Groq (Llama 3.3 70B)...")
-            result = call_groq_fallback(groq_key, contents, system_instruction)
-            print("✅ הצלחה עם Groq Backup!")
-            return "Groq (Llama 3.3)", result
+            print("⚡ מפתחות גוגל עמוסים, מפעיל גיבוי Groq...")
+            result = call_groq_api(groq_key, contents, system_instruction)
+            print("✅ הצלחה עם Groq!")
+            return "Groq Backup", result
         except Exception as e:
-            print(f"⚠️ שגיאה גם ב-Groq: {e}")
+            print(f"⚠️ שגיאה ב-Groq: {e}")
             last_error = f"Groq Error: {e}"
 
     raise RuntimeError(f"כל הניסיונות נכשלו: {last_error}")
 
 def main():
-    # 1. שליפת מפתחות
+    # 1. איסוף משתנים
     github_token = os.environ["GITHUB_TOKEN"]
     primary_gemini_key = os.environ.get("GEMINI_API_KEY", "")
     backup_gemini_key = os.environ.get("GEMINI_API_KEY_2", "")
@@ -136,7 +130,7 @@ def main():
     repo = gh.get_repo(repo_name)
     issue = repo.get_issue(issue_number)
 
-    # 2. בניית קונטקסט מלא
+    # 2. קונטקסט
     file_list, repo_files_content = get_repo_files_and_content()
     context_prefix = (
         f"[Repository: {repo_name}]\n"
@@ -151,23 +145,28 @@ def main():
         role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
         conversation.append({"role": role, "parts": [{"text": comment.body or ""}]})
 
-    # 3. הנחיית מערכת
+    # 3. הנחיית מערכת משודרגת
     system_instruction = """
     You are an autonomous AI software engineer operating inside this GitHub repository.
     You communicate naturally, clearly, and helpfully in Hebrew.
     
-    CRITICAL: You MUST ALWAYS return a VALID JSON object (no markdown code blocks):
+    CRITICAL WORKFLOW RULES:
+    1. ALWAYS return a VALID JSON object (no markdown code blocks around the JSON).
+    2. GitHub security prevents automated bots from pushing commits to `.github/workflows/`.
+       - NEVER include files starting with `.github/workflows/` in `files_to_update`.
+       - If you recommend or design optimizations/changes for `.github/workflows/` (e.g. `gemini_agent.yml`), explain them clearly inside `chat_response` and provide the exact YAML code block for the user to copy-paste manually!
+       - You CAN modify `.github/scripts/agent.py` and ALL application files directly via `files_to_update`.
     
     IF CHATTING / EXPLAINING / BRAINSTORMING:
     {
       "action": "chat",
-      "chat_response": "Your natural markdown response in Hebrew"
+      "chat_response": "Your natural markdown response in Hebrew (including YAML suggestions if relevant)"
     }
     
     IF INSTRUCTED TO APPLY / COMMIT / EXECUTE:
     {
       "action": "commit",
-      "chat_response": "Summary in Hebrew of the applied changes",
+      "chat_response": "Summary in Hebrew of the applied changes (and manual YAML instructions if needed)",
       "commit_message": "Clear Git commit message",
       "branch_name": "ai-feature-name",
       "files_to_update": [
@@ -180,9 +179,9 @@ def main():
     }
     """
 
-    # 4. ביצוע השאילתה
+    # 4. הרצה
     try:
-        provider_used, response_data = generate_with_failover(gemini_keys, groq_key, conversation, system_instruction)
+        provider_used, response_data = generate_with_smart_retry(gemini_keys, groq_key, conversation, system_instruction)
     except Exception as e:
         issue.create_comment(f"⚠️ המערכת בעומס זמני מול ה-API: {str(e)}")
         return
@@ -196,7 +195,10 @@ def main():
             branch = response_data.get("branch_name", f"ai-patch-issue-{issue_number}")
             subprocess.run(["git", "checkout", "-B", branch], check=True)
             
-            for item in response_data.get("files_to_update", []):
+            # סינון בטיחותי - קבצים שמותר לדחוף
+            valid_files = [f for f in response_data.get("files_to_update", []) if not f["path"].startswith(".github/workflows/")]
+            
+            for item in valid_files:
                 filepath = item["path"]
                 if os.path.dirname(filepath):
                     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -205,7 +207,7 @@ def main():
                 subprocess.run(["git", "add", filepath], check=True)
 
             for del_path in response_data.get("files_to_delete", []):
-                if os.path.exists(del_path):
+                if not del_path.startswith(".github/workflows/") and os.path.exists(del_path):
                     os.remove(del_path)
                     subprocess.run(["git", "rm", del_path], check=True)
 

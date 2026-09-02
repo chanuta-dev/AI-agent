@@ -1,13 +1,9 @@
 import os
 import json
-import time
 import subprocess
 from google import genai
 from google.genai import types
 from github import Github, Auth
-
-# שימוש בלעדי ב-Gemini 3.7 Flash
-MODEL_NAME = "gemini-3.7-flash"
 
 def get_repo_structure():
     """סורק את מבנה הפרויקט הקיים."""
@@ -19,37 +15,59 @@ def get_repo_structure():
             tree.append(os.path.normpath(os.path.join(root, f)))
     return tree
 
-def run_chat(client, history_contents, latest_message, system_instruction):
-    """מריץ את הצ'אט מול Gemini 3.7 Flash עם ניסיונות חוזרים במקרה של עומס רגעי."""
-    last_error = None
-    max_retries = 3
+def get_best_available_model(client):
+    """שולף דינמית את מודל ה-Flash העדכני ביותר שפעיל בחשבון."""
+    try:
+        models = list(client.models.list())
+        flash_models = [
+            m.name.replace("models/", "")
+            for m in models
+            if "flash" in m.name.lower() and "exp" not in m.name.lower()
+        ]
+        if flash_models:
+            return flash_models[-1]
+    except Exception:
+        pass
+    return "gemini-3.7-flash"
 
-    for attempt in range(max_retries):
-        try:
-            print(f"🔄 מתחבר ל-{MODEL_NAME} (ניסיון {attempt + 1}/{max_retries})...")
-            
-            chat = client.chats.create(
-                model=MODEL_NAME,
-                history=history_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.2
-                )
-            )
-            
-            response = chat.send_message(latest_message)
-            print(f"✅ תגובה התקבלה בהצלחה מ-{MODEL_NAME}!")
-            return response.text.strip()
+# --- הכלי של Gemini לעדכון קבצים ב-GitHub ---
+def apply_changes(commit_message: str, branch_name: str, files_to_update: list[dict], files_to_delete: list[str] = []) -> str:
+    """
+    Applies code changes, writes or deletes files, and pushes to a Git branch.
+    
+    Args:
+        commit_message: Clear description of the changes made.
+        branch_name: The branch name for this feature/fix.
+        files_to_update: List of dicts where each item has 'path' and 'content'.
+        files_to_delete: List of file paths to remove.
+    """
+    # יצירת Branch
+    subprocess.run(["git", "checkout", "-B", branch_name], check=True)
+    
+    # כתיבת קבצים מעודכנים
+    for item in files_to_update:
+        filepath = item["path"]
+        os.makedirs(os.path.dirname(filepath), exist_ok=True) if os.path.dirname(filepath) else None
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(item["content"])
+        subprocess.run(["git", "add", filepath], check=True)
 
-        except Exception as e:
-            print(f"⚠️ עומס רגעי או שגיאה ({str(e)}), ממתין ומנסה שוב...")
-            last_error = e
-            time.sleep(2.5)
+    # מחיקת קבצים
+    for del_path in files_to_delete:
+        if os.path.exists(del_path):
+            os.remove(del_path)
+            subprocess.run(["git", "rm", del_path], check=True)
 
-    raise RuntimeError(f"שגיאה בהתחברות ל-{MODEL_NAME} לאחר {max_retries} ניסיונות: {last_error}")
+    # ביצוע Commit ודחיפה
+    subprocess.run(["git", "config", "--global", "user.name", "Gemini Bot"], check=True)
+    subprocess.run(["git", "config", "--global", "user.email", "gemini-bot@github.com"], check=True)
+    subprocess.run(["git", "commit", "-m", commit_message], check=True)
+    subprocess.run(["git", "push", "origin", branch_name, "--force"], check=True)
+
+    return f"SUCCESS: pushed to {branch_name}"
 
 def main():
-    # 1. אתחול והתחברות
+    # 1. התחברות
     github_token = os.environ["GITHUB_TOKEN"]
     gemini_api_key = os.environ["GEMINI_API_KEY"]
     repo_name = os.environ["REPO_NAME"]
@@ -61,128 +79,89 @@ def main():
     issue = repo.get_issue(issue_number)
     client = genai.Client(api_key=gemini_api_key)
 
-    # 2. איסוף היסטוריית השיחה מתוך ה-Issue
+    selected_model = get_best_available_model(client)
+
+    # 2. בניית היסטוריית השיחה מה-Issue
     files_list = get_repo_structure()
     context_prefix = f"[System Context: Existing project files: {json.dumps(files_list)}]\n\n"
     
     initial_user_msg = context_prefix + f"Issue #{issue.number} Title: {issue.title}\n\n{issue.body or ''}"
+    conversation = [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=initial_user_msg)]
+        )
+    ]
     
-    all_comments = list(issue.get_comments())
-    history_contents = []
-    
-    if all_comments:
-        history_contents.append(
+    for comment in issue.get_comments():
+        role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
+        conversation.append(
             types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=initial_user_msg)]
+                role=role,
+                parts=[types.Part.from_text(text=comment.body or "")]
             )
         )
-        for comment in all_comments[:-1]:
-            role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
-            history_contents.append(
-                types.Content(
-                    role=role,
-                    parts=[types.Part.from_text(text=comment.body or "")]
-                )
-            )
-        last_comment = all_comments[-1]
-        latest_message = last_comment.body or ""
-    else:
-        latest_message = initial_user_msg
 
-    # 3. הנחיות מערכת (System Instruction)
+    # 3. הנחיות מערכת
     system_instruction = """
-    You are Gemini 3.7, an autonomous and self-upgrading software engineer operating directly inside a GitHub repository.
+    You are Gemini, an autonomous software engineer collaborating with the user directly inside a GitHub repository.
     
-    CAPABILITIES:
-    1. Chat, consult, and brainstorm with the user.
-    2. Write, update, or delete ANY file in this repository (including Kotlin/Android, Python, Web, Workflows, and even your own code in agent.py!).
-    
-    PROTOCOL:
-    - If you and the user are just chatting/planning: Respond naturally in markdown text.
-    - If the user instructs to APPLY / COMMIT / EXECUTE (or says words like 'תיישם', 'בצע', 'סגור על זה', 'apply'):
-      You must respond ONLY with a raw JSON object formatted like this (do NOT wrap in markdown code blocks like ```json):
-      {
-        "action": "commit",
-        "chat_response": "Friendly summary in Hebrew of what you did",
-        "commit_message": "Clear git commit message",
-        "branch_name": "ai-feature-name",
-        "files_to_update": [
-          {
-            "path": "path/to/file.ext",
-            "content": "Full new content of file"
-          }
-        ],
-        "files_to_delete": ["path/to/deleted_file.ext"]
-      }
+    BEHAVIOR:
+    - You communicate in fluent, natural markdown text (in Hebrew as requested).
+    - You brainstorm, explain concepts, ask questions, and share code snippets naturally.
+    - ONLY when the user asks to execute/apply the changes (e.g., 'תיישם', 'בצע', 'apply', 'commit'), call the `apply_changes` function with the complete file contents and a clear commit message.
     """
 
-    # 4. שליחת הבקשה ל-Gemini 3.7
+    # 4. קריאה ל-Gemini עם הכלי apply_changes
     try:
-        resp_text = run_chat(client, history_contents, latest_message, system_instruction)
+        response = client.models.generate_content(
+            model=selected_model,
+            contents=conversation,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=[apply_changes],
+                temperature=0.3
+            )
+        )
     except Exception as e:
-        issue.create_comment(f"⚠️ שרת Gemini 3.7 בעומס זמני, אנא נסה להגיב שוב בעוד מספר שניות: {str(e)}")
+        issue.create_comment(f"⚠️ חלה שגיאה בתקשורת עם המודל ({selected_model}): {str(e)}")
         return
 
-    # 5. ניקוי עטיפות Markdown
-    clean_json_str = resp_text
-    if clean_json_str.startswith("```json"):
-        clean_json_str = clean_json_str[7:]
-    elif clean_json_str.startswith("```"):
-        clean_json_str = clean_json_str[3:]
-    if clean_json_str.endswith("```"):
-        clean_json_str = clean_json_str[:-3]
-    clean_json_str = clean_json_str.strip()
+    # 5. בדיקה האם Gemini החליט להפעיל את הכלי (לבצע Commit)
+    if response.function_calls:
+        for call in response.function_calls:
+            if call.name == "apply_changes":
+                args = call.args
+                commit_msg = args.get("commit_message", "AI code update")
+                branch = args.get("branch_name", f"ai-patch-issue-{issue_number}")
+                files_up = args.get("files_to_update", [])
+                files_del = args.get("files_to_delete", [])
 
-    # 6. ביצוע Commit במידה ואישרת
-    if clean_json_str.startswith("{") and '"action": "commit"' in clean_json_str:
-        try:
-            data = json.loads(clean_json_str)
-            branch = data.get("branch_name", f"ai-patch-issue-{issue_number}")
-            
-            # יצירת ענף
-            subprocess.run(["git", "checkout", "-B", branch], check=True)
-            
-            # כתיבת קבצים
-            for item in data.get("files_to_update", []):
-                filepath = item["path"]
-                os.makedirs(os.path.dirname(filepath), exist_ok=True) if os.path.dirname(filepath) else None
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(item["content"])
-                subprocess.run(["git", "add", filepath], check=True)
+                try:
+                    # הפעלת הפונקציה
+                    apply_changes(commit_msg, branch, files_up, files_del)
 
-            # מחיקת קבצים אם התבקש
-            for del_path in data.get("files_to_delete", []):
-                if os.path.exists(del_path):
-                    os.remove(del_path)
-                    subprocess.run(["git", "rm", del_path], check=True)
+                    # פתיחת PR
+                    pr_title = f"🤖 Gemini: {commit_msg}"
+                    pr_body = f"Closes #{issue_number}\n\nApplied changes automatically based on issue conversation."
+                    try:
+                        pr = repo.create_pull(title=pr_title, body=pr_body, head=branch, base="main")
+                        pr_url = pr.html_url
+                    except Exception:
+                        pr_url = f"https://github.com/{repo_name}/tree/{branch}"
 
-            # שמירה ודחיפה ל-GitHub
-            subprocess.run(["git", "config", "--global", "user.name", "Gemini 3.7 Bot"], check=True)
-            subprocess.run(["git", "config", "--global", "user.email", "gemini-bot@github.com"], check=True)
-            subprocess.run(["git", "commit", "-m", data.get("commit_message", "AI auto-update")], check=True)
-            subprocess.run(["git", "push", "origin", branch, "--force"], check=True)
+                    explanation = response.text if response.text else "השינויים יושמו בהצלחה בקוד הפרויקט."
+                    issue.create_comment(f"✨ **השינויים יושמו בהצלחה!**\n\n{explanation}\n\n🔗 **Pull Request מוכן:** {pr_url}")
+                    return
+                except Exception as e:
+                    issue.create_comment(f"⚠️ חלה שגיאה בעת ביצוע ה-Commit: {str(e)}")
+                    return
 
-            # פתיחת Pull Request
-            pr_title = f"🤖 Gemini 3.7: {data.get('commit_message')}"
-            pr_body = f"Closes #{issue_number}\n\n{data.get('chat_response')}"
-            
-            try:
-                pr = repo.create_pull(title=pr_title, body=pr_body, head=branch, base="main")
-                pr_url = pr.html_url
-            except Exception:
-                pr_url = f"https://github.com/{repo_name}/tree/{branch}"
-
-            summary_msg = f"✨ **השינויים יושמו בהצלחה על ידי Gemini 3.7!**\n\n{data.get('chat_response')}\n\n🔗 **Pull Request:** {pr_url}"
-            issue.create_comment(summary_msg)
-            return
-
-        except Exception as e:
-            issue.create_comment(f"⚠️ חלה שגיאה בביצוע הקומיט: {str(e)}\n\nטקסט מהמודל:\n{resp_text}")
-            return
-
-    # תגובת שיחה רגילה
-    issue.create_comment(resp_text)
+    # 6. אם זו הייתה שיחת צ'אט רגילה - פרסם את התגובה הטבעית כרגיל
+    if response.text:
+        issue.create_comment(response.text)
+    else:
+        issue.create_comment("קיבלתי את ההודעה, איך תרצה להתקדם?")
 
 if __name__ == "__main__":
     main()

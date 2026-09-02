@@ -5,16 +5,28 @@ import subprocess
 import urllib.request
 import urllib.error
 import time
-from github import Github, Auth
 
 MODEL_NAME = "gemini-3.7-flash"
 
-# מודלים מובילים ב-Groq לגיבוי
+# מודלים נתמכים ומהירים ב-Groq לגיבוי מיידי
 GROQ_CANDIDATE_MODELS = [
     "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b"
+    "llama-3.1-8b-instant"
 ]
+
+def github_api_request(url, token, data=None, method="GET"):
+    """ביצוע קריאות ישירות ל-GitHub REST API ללא צורך בספריות חיצוניות."""
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "GitHub-Agent-Bot"
+    }
+    encoded_data = json.dumps(data).encode("utf-8") if data else None
+    if encoded_data:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=encoded_data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
 
 def get_repo_files_and_content():
     """סורק את כל קבצי הפרויקט וטוען את תוכנם לקונטקסט."""
@@ -87,7 +99,7 @@ def call_groq_api(groq_key, contents, system_instruction):
             data = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(url, data=data, headers=headers)
             
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with urllib.request.urlopen(req, timeout=25) as response:
                 res_data = json.loads(response.read().decode())
                 raw_text = res_data['choices'][0]['message']['content']
                 print(f"✅ הצלחה עם מודל Groq: {model}")
@@ -99,47 +111,43 @@ def call_groq_api(groq_key, contents, system_instruction):
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_groq_error}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון Failover שמחליף מפתחות וספקים ברגע של 429 או 503."""
+    """מנגנון Failover שמחליף מפתחות וספקים במהירות בעת עומס."""
     last_error = None
 
-    # 1. ניסיון מול מפתחות Gemini 3.7
+    # 1. ניסיון מול מפתחות Gemini
     for i, key in enumerate(gemini_keys):
         if not key:
             continue
         try:
-            print(f"🔄 מנסה Gemini 3.7 (מפתח #{i + 1})...")
+            print(f"🔄 מנסה Gemini (מפתח #{i + 1})...")
             result = call_gemini_api(key, contents, system_instruction)
-            print(f"✅ הצלחה עם Gemini 3.7 (מפתח #{i + 1})")
+            print(f"✅ הצלחה עם Gemini (מפתח #{i + 1})")
             return "Gemini 3.7", result
         except urllib.error.HTTPError as e:
             status = e.code
             err_body = e.read().decode()
             print(f"⚠️ מפתח #{i + 1} נכשל עם שגיאה {status}")
-            last_error = f"Gemini Error {status}"
-
-            # אם יש הגבלת קצב של שניות בודדות - נמתין וננסה שוב
+            last_error = f"Gemini HTTP {status}"
             if status == 429:
                 match = re.search(r'retry in (\d+(\.\d+)?)s', err_body)
                 if match:
-                    wait_sec = float(match.group(1)) + 1.5
-                    if wait_sec <= 25:
+                    wait_sec = float(match.group(1)) + 1.0
+                    if wait_sec <= 10:
                         print(f"⏳ ממתין {wait_sec:.1f} שניות להתאוששות מכסת Gemini...")
                         time.sleep(wait_sec)
                         try:
                             result = call_gemini_api(key, contents, system_instruction)
-                            print(f"✅ הצלחה עם Gemini 3.7 (מפתח #{i + 1}) לאחר המתנה!")
                             return "Gemini 3.7", result
                         except Exception:
                             pass
             continue
         except Exception as e:
             last_error = str(e)
-            time.sleep(1)
 
-    # 2. גיבוי Groq
+    # 2. גיבוי מיידי Groq
     if groq_key:
         try:
-            print("⚡ מפתחות גוגל עמוסים, מפעיל גיבוי Groq...")
+            print("⚡ Gemini עמוס, מפעיל גיבוי Groq...")
             used_model, result = call_groq_api(groq_key, contents, system_instruction)
             return f"Groq ({used_model})", result
         except Exception as e:
@@ -148,24 +156,28 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
 
     raise RuntimeError(f"כל הניסיונות נכשלו: {last_error}")
 
+def post_issue_comment(repo_name, issue_number, token, body):
+    """שליחת תגובה ל-Issue ישירות דרך ה-API."""
+    url = f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments"
+    try:
+        github_api_request(url, token, data={"body": body}, method="POST")
+    except Exception as e:
+        print(f"שגיאה בשליחת תגובה: {e}")
+
 def main():
-    # 1. איסוף משתנים
     github_token = os.environ["GITHUB_TOKEN"]
     primary_gemini_key = os.environ.get("GEMINI_API_KEY", "")
     backup_gemini_key = os.environ.get("GEMINI_API_KEY_2", "")
     groq_key = os.environ.get("GROQ_API_KEY", "")
 
     gemini_keys = [k for k in [primary_gemini_key, backup_gemini_key] if k]
-
     repo_name = os.environ["REPO_NAME"]
     issue_number = int(os.environ["ISSUE_NUMBER"])
 
-    auth = Auth.Token(github_token)
-    gh = Github(auth=auth)
-    repo = gh.get_repo(repo_name)
-    issue = repo.get_issue(issue_number)
+    # טעינת נתוני Issue ותגובות
+    issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
+    comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
-    # 2. קונטקסט
     file_list, repo_files_content = get_repo_files_and_content()
     context_prefix = (
         f"[Repository: {repo_name}]\n"
@@ -173,14 +185,14 @@ def main():
         f"[Files Content:\n{json.dumps(repo_files_content, ensure_ascii=False, indent=2)}]\n\n"
     )
     
-    initial_user_msg = context_prefix + f"Issue #{issue.number} Title: {issue.title}\n\n{issue.body or ''}"
+    initial_user_msg = context_prefix + f"Issue #{issue_number} Title: {issue_data.get('title', '')}\n\n{issue_data.get('body') or ''}"
     conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     
-    for comment in issue.get_comments():
-        role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
-        conversation.append({"role": role, "parts": [{"text": comment.body or ""}]})
+    for comment in comments_data:
+        author = comment.get("user", {}).get("login", "")
+        role = "model" if author.endswith("[bot]") or author == "github-actions[bot]" else "user"
+        conversation.append({"role": role, "parts": [{"text": comment.get("body") or ""}]})
 
-    # 3. הנחיות מערכת
     system_instruction = """
     You are an autonomous AI software engineer operating inside this GitHub repository.
     You communicate naturally, clearly, and helpfully in Hebrew.
@@ -214,17 +226,15 @@ def main():
     }
     """
 
-    # 4. הרצה
     try:
         provider_used, response_data = generate_with_smart_retry(gemini_keys, groq_key, conversation, system_instruction)
     except Exception as e:
-        issue.create_comment(f"⚠️ המערכת בעומס זמני מול ה-API: {str(e)}")
+        post_issue_comment(repo_name, issue_number, github_token, f"⚠️ המערכת בעומס זמני מול ה-API: {str(e)}")
         return
 
     action = response_data.get("action", "chat")
     chat_reply = response_data.get("chat_response", "אני כאן כדי לעזור!")
 
-    # 5. ביצוע פעולות
     if action == "commit":
         try:
             branch = response_data.get("branch_name", f"ai-patch-issue-{issue_number}")
@@ -248,24 +258,35 @@ def main():
             subprocess.run(["git", "config", "--global", "user.name", "Gemini AI Agent"], check=True)
             subprocess.run(["git", "config", "--global", "user.email", "gemini-bot@github.com"], check=True)
             subprocess.run(["git", "commit", "-m", response_data.get("commit_message", "AI auto-update")], check=True)
+            
+            # אימות ודחיפה באמצעות Access Token ישירות
+            remote_url = f"https://x-access-token:{github_token}@github.com/{repo_name}.git"
+            subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True)
             subprocess.run(["git", "push", "origin", branch, "--force"], check=True)
 
             pr_title = f"🤖 AI Update: {response_data.get('commit_message')}"
             pr_body = f"Closes #{issue_number}\n\n{chat_reply}\n\n*Generated with {provider_used}*"
             
+            pr_data = {
+                "title": pr_title,
+                "body": pr_body,
+                "head": branch,
+                "base": "main"
+            }
+            
             try:
-                pr = repo.create_pull(title=pr_title, body=pr_body, head=branch, base="main")
-                pr_url = pr.html_url
+                res = github_api_request(f"https://api.github.com/repos/{repo_name}/pulls", github_token, data=pr_data, method="POST")
+                pr_url = res.get("html_url", f"https://github.com/{repo_name}/tree/{branch}")
             except Exception:
                 pr_url = f"https://github.com/{repo_name}/tree/{branch}"
 
             summary = f"✨ **בוצע בהצלחה (באמצעות {provider_used})!**\n\n{chat_reply}\n\n🔗 **Pull Request מוכן:** {pr_url}"
-            issue.create_comment(summary)
+            post_issue_comment(repo_name, issue_number, github_token, summary)
 
         except Exception as e:
-            issue.create_comment(f"⚠️ חלה שגיאה בביצוע ה-Commit: {str(e)}")
+            post_issue_comment(repo_name, issue_number, github_token, f"⚠️ חלה שגיאה בביצוע ה-Commit: {str(e)}")
     else:
-        issue.create_comment(chat_reply)
+        post_issue_comment(repo_name, issue_number, github_token, chat_reply)
 
 if __name__ == "__main__":
     main()

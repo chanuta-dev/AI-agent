@@ -6,21 +6,38 @@ import urllib.error
 import time
 from github import Github, Auth
 
-# נעילה מוחלטת על המודל החכם והעדכני ביותר!
 MODEL_NAME = "gemini-3.7-flash"
 
-def get_repo_structure():
-    """סורק את מבנה הפרויקט הקיים."""
-    tree = []
+def get_repo_files_and_content():
+    """סורק את כל קבצי הפרויקט (כולל .github) וטוען את תוכנם לקונטקסט של ה-AI."""
+    repo_files = {}
+    file_list = []
+    
     for root, dirs, files in os.walk("."):
-        if ".git" in root or "__pycache__" in root:
+        parts = os.path.normpath(root).split(os.sep)
+        # מתעלם מתיקיית .git האמיתית אבל לא מ-.github!
+        if ".git" in parts or "__pycache__" in parts:
             continue
+            
         for f in files:
-            tree.append(os.path.normpath(os.path.join(root, f)))
-    return tree
+            filepath = os.path.normpath(os.path.join(root, f))
+            # ביטול ה-./ מתחילת הנתיב אם יש
+            if filepath.startswith(f".{os.sep}"):
+                filepath = filepath[2:]
+            file_list.append(filepath)
+            
+            # קריאת תוכן הקבצים (עד 30KB לקובץ כדי לא להעמיס)
+            try:
+                if os.path.getsize(filepath) < 30000:
+                    with open(filepath, "r", encoding="utf-8", errors="ignore") as file_handle:
+                        repo_files[filepath] = file_handle.read()
+            except Exception:
+                pass
+                
+    return file_list, repo_files
 
 def generate_content_rest(api_key, contents, system_instruction):
-    """קריאה ישירה ונקייה ל-API של גוגל (המקבילה המדויקת ל-fetch מ-JS)."""
+    """קריאה ישירה ל-API של Gemini 3.7."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
     
     payload = {
@@ -29,7 +46,7 @@ def generate_content_rest(api_key, contents, system_instruction):
         },
         "contents": contents,
         "generationConfig": {
-            "responseMimeType": "application/json", # מבטיח תמיד קבלת JSON טהור
+            "responseMimeType": "application/json",
             "temperature": 0.2
         }
     }
@@ -37,17 +54,13 @@ def generate_content_rest(api_key, contents, system_instruction):
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     
-    try:
-        with urllib.request.urlopen(req) as response:
-            res_data = json.loads(response.read().decode())
-            raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
-            return json.loads(raw_text) # ממיר את הטקסט למילון פייתון
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        raise Exception(f"API Error {e.code}: {error_body}")
+    with urllib.request.urlopen(req) as response:
+        res_data = json.loads(response.read().decode())
+        raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
+        return json.loads(raw_text)
 
 def main():
-    # 1. התחברות ל-GitHub
+    # 1. התחברות
     github_token = os.environ["GITHUB_TOKEN"]
     gemini_api_key = os.environ["GEMINI_API_KEY"]
     repo_name = os.environ["REPO_NAME"]
@@ -58,9 +71,14 @@ def main():
     repo = gh.get_repo(repo_name)
     issue = repo.get_issue(issue_number)
 
-    # 2. בניית היסטוריית השיחה מה-Issue
-    files_list = get_repo_structure()
-    context_prefix = f"[System Context: Existing project files: {json.dumps(files_list)}]\n\n"
+    # 2. איסוף כל קבצי הפרויקט והתוכן שלהם
+    file_list, repo_files_content = get_repo_files_and_content()
+    
+    context_prefix = (
+        f"[Repository Name: {repo_name}]\n"
+        f"[Existing Files Structure: {json.dumps(file_list)}]\n"
+        f"[Files Content in Project:\n{json.dumps(repo_files_content, ensure_ascii=False, indent=2)}]\n\n"
+    )
     
     initial_user_msg = context_prefix + f"Issue #{issue.number} Title: {issue.title}\n\n{issue.body or ''}"
     
@@ -72,23 +90,25 @@ def main():
         role = "model" if comment.user.login.endswith("[bot]") or comment.user.login == "github-actions[bot]" else "user"
         conversation.append({"role": role, "parts": [{"text": comment.body or ""}]})
 
-    # 3. הנחיית מערכת שתמיד דורשת JSON 
+    # 3. הנחיית מערכת
     system_instruction = """
-    You are an autonomous software engineer operating inside a GitHub repository.
-    You communicate naturally in Hebrew.
+    You are Gemini 3.7, an autonomous AI software engineer operating directly inside this GitHub repository.
+    You have full visibility of all repository files and their contents provided in the context.
     
-    CRITICAL: You MUST ALWAYS respond with a VALID JSON object. Do not wrap it in markdown.
+    COMMUNICATION:
+    - Respond naturally, politely, and professionally in Hebrew.
+    - ALWAYS return a strict JSON object with no markdown wrappers.
     
-    IF THE USER IS JUST CHATTING, ASKING QUESTIONS, OR PLANNING:
+    IF CHATTING / EXPLAINING / BRAINSTORMING:
     {
       "action": "chat",
-      "chat_response": "Your natural, friendly markdown response in Hebrew"
+      "chat_response": "Your markdown answer in Hebrew"
     }
     
-    IF THE USER EXPLICITLY ASKS TO APPLY, EXECUTE OR COMMIT CHANGES (e.g., 'תיישם', 'בצע'):
+    IF INSTRUCTED TO APPLY / COMMIT / EXECUTE:
     {
       "action": "commit",
-      "chat_response": "Friendly summary of what you did",
+      "chat_response": "Summary in Hebrew of the changes made",
       "commit_message": "Clear Git commit message",
       "branch_name": "ai-feature-name",
       "files_to_update": [
@@ -101,23 +121,24 @@ def main():
     }
     """
 
-    # 4. ביצוע הקריאה עם מנגנון Retry במקרה של עומס רגעי
+    # 4. ביצוע הקריאה עם מנגנון Retry חכם נגד עומס (503)
     response_data = None
-    for attempt in range(3):
+    max_retries = 4
+    for attempt in range(max_retries):
         try:
             response_data = generate_content_rest(gemini_api_key, conversation, system_instruction)
             break
         except Exception as e:
-            if attempt == 2:
+            if attempt == max_retries - 1:
                 issue.create_comment(f"⚠️ חלה שגיאת תקשורת מול המודל ({MODEL_NAME}): {str(e)}")
                 return
-            time.sleep(2.5) # המתנה של 2.5 שניות לפני ניסיון חוזר
+            # המתנה שגדלה בכל ניסיון (2s, 4s, 6s) להתאוששות מעומס רגעי
+            time.sleep((attempt + 1) * 2)
 
-    # 5. חילוץ התשובה
+    # 5. עיבוד התשובה
     action = response_data.get("action", "chat")
     chat_reply = response_data.get("chat_response", "אני כאן כדי לעזור!")
 
-    # 6. טיפול בפעולה (Push לקוד או שיחה)
     if action == "commit":
         try:
             branch = response_data.get("branch_name", f"ai-patch-issue-{issue_number}")
@@ -157,7 +178,6 @@ def main():
         except Exception as e:
             issue.create_comment(f"⚠️ חלה שגיאה בביצוע ה-Commit: {str(e)}")
     else:
-        # בשיחה רגילה - המשתמש מקבל רק את הטקסט הטבעי!
         issue.create_comment(chat_reply)
 
 if __name__ == "__main__":

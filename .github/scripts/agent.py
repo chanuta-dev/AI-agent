@@ -8,14 +8,6 @@ import time
 
 MODEL_NAME = "gemini-3.7-flash"
 
-# המודלים המדויקים והפעילים שבדקנו כרגע בחשבון ה-Groq שלך
-GROQ_MODELS = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.6-27b",
-    "groq/compound"
-]
-
 def github_api_request(url, token, data=None, method="GET"):
     """קריאה ישירה ל-GitHub REST API ללא ספריות כבדות."""
     headers = {
@@ -37,7 +29,7 @@ def get_repo_files_and_content():
     
     for root, dirs, files in os.walk("."):
         parts = os.path.normpath(root).split(os.sep)
-        if ".git" in parts or "__pycache__" in parts:
+        if ".git" in parts or "__pycache__" in parts or ".agent_core" in parts:
             continue
             
         for f in files:
@@ -74,8 +66,44 @@ def call_gemini_api(api_key, contents, system_instruction):
         raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
         return json.loads(raw_text)
 
+def get_available_groq_models(groq_key):
+    """שליפת רשימת המודלים הזמינים בזמן אמת מתוך חשבון ה-Groq."""
+    url = "https://api.groq.com/openai/v1/models"
+    headers = {
+        'Authorization': f'Bearer {groq_key.strip()}',
+        'User-Agent': 'Mozilla/5.0'
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            models = [m["id"] for m in data.get("data", [])]
+            
+            # סינון מודלים שאינם מודלי שיחה/טקסט (כמו whisper, prompt-guard וכו')
+            filtered = [
+                m for m in models 
+                if not any(bad in m.lower() for bad in ["whisper", "guard", "tts", "vision"])
+            ]
+            
+            # דירוג מודלים לפי עדיפות איכות
+            priority_keywords = ["120b", "3.8", "3.6", "27b", "20b", "compound", "allam", "orpheus"]
+            def sort_key(model_id):
+                for idx, kw in enumerate(priority_keywords):
+                    if kw in model_id.lower():
+                        return idx
+                return len(priority_keywords)
+            
+            filtered.sort(key=sort_key)
+            return filtered if filtered else models
+    except Exception as e:
+        print(f"⚠️ שגיאה בשליפת מודלי Groq דינמית: {e}")
+        return ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "groq/compound"]
+
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי למודלים המאומתים ב-Groq."""
+    """קריאת גיבוי למודלים הזמינים בחשבון ה-Groq שלך."""
+    available_models = get_available_groq_models(groq_key)
+    print(f"📋 מודלי Groq זמינים לחשבון: {available_models}")
+    
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
     for c in contents:
@@ -85,11 +113,11 @@ def call_groq_api(groq_key, contents, system_instruction):
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {groq_key.strip()}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0'
     }
 
     last_err = None
-    for model in GROQ_MODELS:
+    for model in available_models:
         try:
             print(f"🔄 מנסה מודל Groq: {model}...")
             payload = {
@@ -113,7 +141,7 @@ def call_groq_api(groq_key, contents, system_instruction):
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון Failover מלא: גוגל #1 -> גוגל #2 -> Groq."""
+    """מנגנון Failover מלא: גוגל #1 -> גוגל #2 -> Groq (דינמי)."""
     last_error = None
 
     # 1. ניסיון מול מפתחות Gemini 3.7

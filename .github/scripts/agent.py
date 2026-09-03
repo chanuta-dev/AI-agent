@@ -6,14 +6,14 @@ import urllib.request
 import urllib.error
 import time
 
-MODEL_NAME = "gemini-3.7-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
-# המודלים המדויקים והפעילים שבדקנו כרגע בחשבון ה-Groq שלך
+# מודלים נתמכים ויציבים ב-Groq API
 GROQ_MODELS = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.6-27b",
-    "groq/compound"
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "gemma2-9b-it"
 ]
 
 def github_api_request(url, token, data=None, method="GET"):
@@ -37,7 +37,7 @@ def get_repo_files_and_content():
     
     for root, dirs, files in os.walk("."):
         parts = os.path.normpath(root).split(os.sep)
-        if ".git" in parts or "__pycache__" in parts:
+        if ".git" in parts or "__pycache__" in parts or ".agent_core" in parts:
             continue
             
         for f in files:
@@ -56,7 +56,7 @@ def get_repo_files_and_content():
     return file_list, repo_files
 
 def call_gemini_api(api_key, contents, system_instruction):
-    """קריאה ישירה ל-Gemini 3.7."""
+    """קריאה ישירה ל-Gemini."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
@@ -116,7 +116,6 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
     """מנגנון Failover מלא: גוגל #1 -> גוגל #2 -> Groq."""
     last_error = None
 
-    # 1. ניסיון מול מפתחות Gemini 3.7
     for i, key in enumerate(gemini_keys):
         if not key:
             continue
@@ -124,7 +123,7 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
             print(f"🔄 מנסה Gemini (מפתח #{i + 1})...")
             result = call_gemini_api(key, contents, system_instruction)
             print(f"✅ הצלחה עם Gemini (מפתח #{i + 1})")
-            return "Gemini 3.7", result
+            return "Gemini", result
         except urllib.error.HTTPError as e:
             status = e.code
             err_body = e.read().decode()
@@ -140,14 +139,13 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
                         time.sleep(wait_sec)
                         try:
                             result = call_gemini_api(key, contents, system_instruction)
-                            return "Gemini 3.7", result
+                            return "Gemini", result
                         except Exception:
                             pass
             continue
         except Exception as e:
             last_error = str(e)
 
-    # 2. מעבר אוטומטי ל-Groq אם גוגל עמוס
     if groq_key:
         try:
             print("⚡ מפתחות גוגל עמוסים, מפעיל גיבוי Groq...")
@@ -177,7 +175,6 @@ def main():
     repo_name = os.environ["REPO_NAME"]
     issue_number = int(os.environ["ISSUE_NUMBER"])
 
-    # טעינת נתוני ה-Issue
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
@@ -260,7 +257,6 @@ def main():
             subprocess.run(["git", "config", "--global", "user.email", "gemini-bot@github.com"], check=True)
             subprocess.run(["git", "commit", "-m", response_data.get("commit_message", "AI auto-update")], check=True)
             
-            # דחיפה עם טוקן גישה ישיר
             remote_url = f"https://x-access-token:{github_token}@github.com/{repo_name}.git"
             subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True)
             subprocess.run(["git", "push", "origin", branch, "--force"], check=True)

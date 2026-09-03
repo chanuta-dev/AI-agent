@@ -5,6 +5,14 @@ on:
     types: [opened]
   issue_comment:
     types: [created]
+  workflow_call:
+    secrets:
+      GEMINI_API_KEY:
+        required: false
+      GEMINI_API_KEY_2:
+        required: false
+      GROQ_API_KEY:
+        required: false
 
 jobs:
   run_gemini_agent:
@@ -16,10 +24,16 @@ jobs:
       issues: write
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Target Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Checkout Central Agent Brain
+        uses: actions/checkout@v4
+        with:
+          repository: chanuta159-design/AI-agent
+          path: .agent_core
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,4 +48,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_NAME: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: python .github/scripts/agent.py
+        run: python .agent_core/.github/scripts/agent.py

@@ -42,7 +42,6 @@ def build_file_tree(file_list, max_depth=3):
         normalized = path.replace("\\", "/")
         parts = normalized.split("/")
         if len(parts) > max_depth + 1:
-            # מכווץ נתיבים עמוקים מדי
             parts = parts[:max_depth] + [f"... ({len(parts) - max_depth} subdirs/files)"]
         curr = tree
         for part in parts:
@@ -70,7 +69,7 @@ def get_repo_files_and_content(issue_context_text=""):
     IGNORE_DIRS = {'.git', '__pycache__', '.agent_core', 'node_modules', 'build', '.gradle', 'bin', 'out', '.idea', 'target', '.vscode'}
     VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties', '.html', '.css', '.cpp', '.h', '.c', '.go', '.rs')
     
-    MAX_TOTAL_CHARS = 35000  # תקציב שמבטיח עמידה בכל המכסות
+    MAX_TOTAL_CHARS = 35000  # תקציב טוקנים קבוע למניעת חריגות
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
@@ -88,8 +87,14 @@ def get_repo_files_and_content(issue_context_text=""):
     def priority_score(filepath):
         score = 0
         fname = os.path.basename(filepath).lower()
+        
+        # 1. קבצי זיכרון ותיעוד פרויקט מקבלים עדיפות עליונה תמיד!
+        if any(k in fname for k in ['summery_for_ai', 'summary_for_ai', 'project.md']):
+            score += 200
+        # 2. אם הקובץ הוזכר ב-Issue
         if fname in issue_words or os.path.splitext(fname)[0] in issue_words:
             score += 100
+        # 3. קבצי הגדרות ובנייה מרכזיים
         if any(k in fname for k in ['readme', 'build.gradle', 'manifest', 'package.json', 'settings.gradle']):
             score += 50
         return score
@@ -104,7 +109,7 @@ def get_repo_files_and_content(issue_context_text=""):
             
         try:
             size = os.path.getsize(filepath)
-            if size < 12000 and (current_chars + size <= MAX_TOTAL_CHARS):
+            if size < 15000 and (current_chars + size <= MAX_TOTAL_CHARS):
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as fh:
                     content = fh.read()
                     repo_files[filepath] = content
@@ -153,7 +158,6 @@ def get_available_groq_models(groq_key):
                 if not any(bad in m.lower() for bad in ["whisper", "guard", "tts", "vision", "orpheus"])
             ]
             
-            # עדיפות ל-compound שמאפשר שימוש כבד
             priority_keywords = ["compound", "120b", "3.8", "3.6", "27b", "20b", "allam"]
             def sort_key(model_id):
                 for idx, kw in enumerate(priority_keywords):
@@ -291,14 +295,12 @@ def main():
     
     initial_user_msg = context_prefix + f"Issue #{issue_number} Title: {issue_data.get('title', '')}\n\n{issue_data.get('body') or ''}"
     
-    # בניית היסטוריית השיחה בצורה חוקית ומסודרת
     raw_conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     for comment in valid_comments:
         author = comment.get("user", {}).get("login", "")
         role = "model" if author.endswith("[bot]") or author == "github-actions[bot]" else "user"
         raw_conversation.append({"role": role, "parts": [{"text": comment.get("body") or ""}]})
 
-    # מיזוג תורות רצופים של אותו תפקיד
     conversation = []
     for msg in raw_conversation:
         if conversation and conversation[-1]["role"] == msg["role"]:
@@ -306,7 +308,7 @@ def main():
         else:
             conversation.append(msg)
 
-    # וידוא קריטי: השיחה חייבת להסתיים תמיד בתור של 'user'!
+    # מוודא שהשיחה תמיד מסתיימת ב-user
     while conversation and conversation[-1]["role"] != "user":
         conversation.pop()
 
@@ -321,6 +323,10 @@ def main():
     1. ALWAYS return a VALID JSON object (no markdown code blocks around the JSON).
     2. NEVER include `.github/workflows/` files in `files_to_update`. If suggesting workflow changes, explain them in `chat_response` and provide the exact YAML snippet for the user.
     3. You CAN modify `.github/scripts/agent.py` and ALL application files directly via `files_to_update`.
+    
+    CRITICAL MEMORY & PROGRESS PROTOCOL RULES:
+    1. Always inspect `summery_for_AI.md` (if present in the repository) to understand the current architecture and project state.
+    2. On EVERY executed task or commit, always maintain and update the tasks/progress section in `summery_for_AI.md` with what was done and what remains.
     
     IF CHATTING / EXPLAINING / BRAINSTORMING:
     {

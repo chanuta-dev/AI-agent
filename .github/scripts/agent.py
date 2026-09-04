@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import time
 
-MODEL_NAME = "gemini-3.7-flash"
+MODEL_NAME = "gemini-3.8-flash"
 
 def extract_json(raw_text):
     """מחלץ אובייקט JSON מתוך טקסט חופשי (כולל תמיכה ב-Markdown או טקסט נלווה)."""

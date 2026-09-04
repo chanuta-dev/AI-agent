@@ -6,7 +6,8 @@ import urllib.request
 import urllib.error
 import time
 
-MODEL_NAME = "gemini-3.8-flash"
+# רשימת המודלים של גוגל לפי סדר עדיפות
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash"]
 
 def extract_json(raw_text):
     """מחלץ אובייקט JSON מתוך טקסט חופשי (כולל תמיכה ב-Markdown או טקסט נלווה)."""
@@ -88,10 +89,10 @@ def get_repo_files_and_content(issue_context_text=""):
         score = 0
         fname = os.path.basename(filepath).lower()
         
-        # 1. קבצי זיכרון ותיעוד פרויקט מקבלים עדיפות עליונה תמיד!
+        # 1. קבצי זיכרון ותיעוד פרויקט מקבלים עדיפות עליונה תמיד
         if any(k in fname for k in ['summery_for_ai', 'summary_for_ai', 'project.md']):
             score += 200
-        # 2. אם הקובץ הוזכר ב-Issue
+        # 2. אם הקובץ מוזכר ישירות ב-Issue
         if fname in issue_words or os.path.splitext(fname)[0] in issue_words:
             score += 100
         # 3. קבצי הגדרות ובנייה מרכזיים
@@ -121,9 +122,9 @@ def get_repo_files_and_content(issue_context_text=""):
     print(f"📊 נטענו {len(repo_files)} קבצים רלוונטיים ({current_chars} תווים מתוך תקציב {MAX_TOTAL_CHARS}).")
     return repo_tree, repo_files
 
-def call_gemini_api(api_key, contents, system_instruction):
-    """קריאה ישירה ל-Gemini 3.7."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
+def call_gemini_api(api_key, model_name, contents, system_instruction):
+    """קריאה ישירה ל-Gemini API עם מודל דינמי ו-Timeout מוגדל."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -135,10 +136,11 @@ def call_gemini_api(api_key, contents, system_instruction):
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     
-    with urllib.request.urlopen(req, timeout=35) as response:
+    # הוגדל ל-50 שניות כדי למנוע The read operation timed out
+    with urllib.request.urlopen(req, timeout=50) as response:
         res_data = json.loads(response.read().decode())
         raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
-        return json.loads(raw_text)
+        return extract_json(raw_text)
 
 def get_available_groq_models(groq_key):
     """שליפת רשימת המודלים הזמינים בזמן אמת מתוך חשבון ה-Groq."""
@@ -172,7 +174,7 @@ def get_available_groq_models(groq_key):
         return ["groq/compound", "groq/compound-mini", "openai/gpt-oss-120b"]
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי למודלים הזמינים ב-Groq."""
+    """קריאת גיבוי למודלים הזמינים ב-Groq עם מנגנון המתנה חכם למכסה."""
     available_models = get_available_groq_models(groq_key)
     print(f"📋 מודלי Groq זמינים לחשבון (לפי סדר עדיפות): {available_models}")
     
@@ -190,54 +192,71 @@ def call_groq_api(groq_key, contents, system_instruction):
 
     last_err = None
     for model in available_models:
-        try:
-            print(f"🔄 מנסה מודל Groq: {model}...")
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.2
-            }
-            data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(url, data=data, headers=headers)
-            
-            with urllib.request.urlopen(req, timeout=35) as response:
-                res_data = json.loads(response.read().decode())
-                raw_text = res_data['choices'][0]['message']['content']
-                print(f"✅ הצלחה עם Groq ({model})!")
-                return model, extract_json(raw_text)
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode('utf-8', errors='ignore')
-            print(f"⚠️ Groq ({model}) נכשל: HTTP {e.code} - {err_body}")
-            last_err = f"HTTP {e.code}: {err_body}"
-        except Exception as e:
-            print(f"⚠️ Groq ({model}) נכשל: {e}")
-            last_err = e
+        for attempt in range(2):  # עד 2 ניסיונות למודל אם נדרשת המתנה קצרה
+            try:
+                print(f"🔄 מנסה מודל Groq: {model} (ניסיון {attempt + 1})...")
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.2
+                }
+                data = json.dumps(payload).encode('utf-8')
+                req = urllib.request.Request(url, data=data, headers=headers)
+                
+                with urllib.request.urlopen(req, timeout=35) as response:
+                    res_data = json.loads(response.read().decode())
+                    raw_text = res_data['choices'][0]['message']['content']
+                    print(f"✅ הצלחה עם Groq ({model})!")
+                    return model, extract_json(raw_text)
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode('utf-8', errors='ignore')
+                print(f"⚠️ Groq ({model}) נכשל: HTTP {e.code} - {err_body}")
+                last_err = f"HTTP {e.code}: {err_body}"
+                
+                # אם המודל ביקש המתנה קצרה להתאפסות המכסה (עד 20 שניות)
+                if e.code == 429 and attempt == 0:
+                    match = re.search(r'try again in (\d+(\.\d+)?)s', err_body)
+                    if match:
+                        wait_sec = float(match.group(1)) + 1.5
+                        if wait_sec <= 20:
+                            print(f"⏳ ממתין {wait_sec:.1f} שניות להתאפסות מכסת ה-TPM של Groq...")
+                            time.sleep(wait_sec)
+                            continue
+                break
+            except Exception as e:
+                print(f"⚠️ Groq ({model}) נכשל: {e}")
+                last_err = e
+                break
 
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון מעבר סדרתי: Gemini #1..5 -> Groq."""
+    """מנגנון מעבר עמיד: בדיקת Gemini 3.8 על כל המפתחות -> בדיקת Gemini 3.7 על כל המפתחות -> Groq."""
     last_error = None
 
-    for i, key in enumerate(gemini_keys):
-        try:
-            print(f"🔄 מנסה Gemini (מפתח #{i + 1} מתוך {len(gemini_keys)})...")
-            result = call_gemini_api(key, contents, system_instruction)
-            print(f"✅ הצלחה עם Gemini (מפתח #{i + 1})")
-            return f"Gemini 3.7 (מפתח #{i + 1})", result
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode('utf-8', errors='ignore')
-            print(f"⚠️ מפתח Gemini #{i + 1} נכשל עם קוד שגיאה {e.code}: {err_body}")
-            last_error = f"Gemini Key #{i + 1} HTTP {e.code}: {err_body}"
-            continue
-        except Exception as e:
-            print(f"⚠️ מפתח Gemini #{i + 1} נכשל: {e}")
-            last_error = str(e)
-            continue
+    # 1. מעבר על מודלי Gemini (3.8 קודם, ואז 3.7)
+    for model_name in GEMINI_MODELS:
+        print(f"\n🚀 בודק מודל גוגל: {model_name} על פני {len(gemini_keys)} מפתחות...")
+        for i, key in enumerate(gemini_keys):
+            try:
+                print(f"🔄 מנסה {model_name} (מפתח #{i + 1} מתוך {len(gemini_keys)})...")
+                result = call_gemini_api(key, model_name, contents, system_instruction)
+                print(f"✅ הצלחה עם {model_name} (מפתח #{i + 1})!")
+                return f"{model_name} (מפתח #{i + 1})", result
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode('utf-8', errors='ignore')
+                print(f"⚠️ {model_name} מפתח #{i + 1} נכשל עם קוד {e.code}: {err_body}")
+                last_error = f"{model_name} Key #{i + 1} HTTP {e.code}: {err_body}"
+                continue
+            except Exception as e:
+                print(f"⚠️ {model_name} מפתח #{i + 1} נכשל: {e}")
+                last_error = str(e)
+                continue
 
+    # 2. מעבר אוטומטי ל-Groq אם כל מודלי ומפתחות Gemini כשלו
     if groq_key:
         try:
-            print("⚡ כל מפתחות Gemini מוצו/עמוסים, מפעיל גיבוי Groq...")
+            print("\n⚡ כל מודלי ומפתחות Gemini מוצו/עמוסים, מפעיל גיבוי Groq...")
             used_model, result = call_groq_api(groq_key, contents, system_instruction)
             return f"Groq ({used_model})", result
         except Exception as e:
@@ -274,7 +293,7 @@ def main():
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
-    # סינון תגובות שגיאה של הבוט
+    # סינון הודעות שגיאה של הבוט
     valid_comments = []
     for comment in comments_data:
         body = comment.get("body") or ""
@@ -308,7 +327,6 @@ def main():
         else:
             conversation.append(msg)
 
-    # מוודא שהשיחה תמיד מסתיימת ב-user
     while conversation and conversation[-1]["role"] != "user":
         conversation.pop()
 

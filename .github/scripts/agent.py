@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import time
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-3.7-flash"
 
 def extract_json(raw_text):
     """מחלץ אובייקט JSON מתוך טקסט חופשי (כולל תמיכה ב-Markdown או טקסט נלווה)."""
@@ -35,12 +35,15 @@ def github_api_request(url, token, data=None, method="GET"):
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
-def build_file_tree(file_list):
-    """מייצר פלט גרפי היררכי מושלם בסגנון TREE /F."""
+def build_file_tree(file_list, max_depth=3):
+    """מייצר עץ קבצים היררכי חכם בסגנון TREE /F עם הגבלת עומק כדי לא להעמיס טוקנים."""
     tree = {}
     for path in sorted(file_list):
         normalized = path.replace("\\", "/")
         parts = normalized.split("/")
+        if len(parts) > max_depth + 1:
+            # מכווץ נתיבים עמוקים מדי
+            parts = parts[:max_depth] + [f"... ({len(parts) - max_depth} subdirs/files)"]
         curr = tree
         for part in parts:
             curr = curr.setdefault(part, {})
@@ -60,14 +63,14 @@ def build_file_tree(file_list):
     return "\n".join(render(tree))
 
 def get_repo_files_and_content(issue_context_text=""):
-    """סורק את קבצי הפרויקט, מייצר עץ TREE /F וטוען קבצים רלוונטיים לפי תקציב."""
+    """סורק את קבצי הפרויקט, מייצר עץ TREE /F קומפקטי וטוען קבצים רלוונטיים."""
     repo_files = {}
     file_list = []
     
     IGNORE_DIRS = {'.git', '__pycache__', '.agent_core', 'node_modules', 'build', '.gradle', 'bin', 'out', '.idea', 'target', '.vscode'}
     VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties', '.html', '.css', '.cpp', '.h', '.c', '.go', '.rs')
     
-    MAX_TOTAL_CHARS = 40000  # תקציב של כ-10,000 טוקנים לשמירה על יציבות מול כל המודלים
+    MAX_TOTAL_CHARS = 35000  # תקציב שמבטיח עמידה בכל המכסות
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
@@ -78,10 +81,8 @@ def get_repo_files_and_content(issue_context_text=""):
                 filepath = filepath[2:]
             file_list.append(filepath)
 
-    # 1. יצירת עץ התיקיות בסגנון TREE /F
-    repo_tree = build_file_tree(file_list)
+    repo_tree = build_file_tree(file_list, max_depth=3)
 
-    # 2. זיהוי קבצים שמוזכרים מפורשות ב-Issue
     issue_words = set(re.findall(r'[\w\.-]+', issue_context_text.lower()))
     
     def priority_score(filepath):
@@ -89,11 +90,10 @@ def get_repo_files_and_content(issue_context_text=""):
         fname = os.path.basename(filepath).lower()
         if fname in issue_words or os.path.splitext(fname)[0] in issue_words:
             score += 100
-        if any(k in fname for k in ['readme', 'build.gradle', 'manifest', 'package.json', 'settings.gradle', 'pom.xml']):
+        if any(k in fname for k in ['readme', 'build.gradle', 'manifest', 'package.json', 'settings.gradle']):
             score += 50
         return score
 
-    # מיון: קבצים שקשורים ל-Issue ייטענו ראשונים
     prioritized_files = sorted(file_list, key=priority_score, reverse=True)
 
     for filepath in prioritized_files:
@@ -104,7 +104,7 @@ def get_repo_files_and_content(issue_context_text=""):
             
         try:
             size = os.path.getsize(filepath)
-            if size < 15000 and (current_chars + size <= MAX_TOTAL_CHARS):
+            if size < 12000 and (current_chars + size <= MAX_TOTAL_CHARS):
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as fh:
                     content = fh.read()
                     repo_files[filepath] = content
@@ -112,7 +112,7 @@ def get_repo_files_and_content(issue_context_text=""):
         except Exception:
             pass
 
-    print(f"🌲 נוצר עץ פרויקט מושלם עבור {len(file_list)} קבצים.")
+    print(f"🌲 נוצר עץ פרויקט קומפקטי עבור {len(file_list)} קבצים.")
     print(f"📊 נטענו {len(repo_files)} קבצים רלוונטיים ({current_chars} תווים מתוך תקציב {MAX_TOTAL_CHARS}).")
     return repo_tree, repo_files
 
@@ -150,11 +150,11 @@ def get_available_groq_models(groq_key):
             
             filtered = [
                 m for m in models 
-                if not any(bad in m.lower() for bad in ["whisper", "guard", "tts", "vision"])
+                if not any(bad in m.lower() for bad in ["whisper", "guard", "tts", "vision", "orpheus"])
             ]
             
-            # עדיפות ל-compound שלו יש מכסה גבוהה של 30,000-70,000 טוקנים
-            priority_keywords = ["compound", "120b", "3.8", "3.6", "27b", "20b", "allam", "orpheus"]
+            # עדיפות ל-compound שמאפשר שימוש כבד
+            priority_keywords = ["compound", "120b", "3.8", "3.6", "27b", "20b", "allam"]
             def sort_key(model_id):
                 for idx, kw in enumerate(priority_keywords):
                     if kw in model_id.lower():
@@ -165,7 +165,7 @@ def get_available_groq_models(groq_key):
             return filtered if filtered else models
     except Exception as e:
         print(f"⚠️ שגיאה בשליפת מודלי Groq דינמית: {e}")
-        return ["groq/compound", "openai/gpt-oss-120b", "qwen/qwen3.8-27b", "groq/compound-mini"]
+        return ["groq/compound", "groq/compound-mini", "openai/gpt-oss-120b"]
 
 def call_groq_api(groq_key, contents, system_instruction):
     """קריאת גיבוי למודלים הזמינים ב-Groq."""
@@ -222,9 +222,9 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
             print(f"✅ הצלחה עם Gemini (מפתח #{i + 1})")
             return f"Gemini 3.7 (מפתח #{i + 1})", result
         except urllib.error.HTTPError as e:
-            status = e.code
-            print(f"⚠️ מפתח Gemini #{i + 1} נכשל עם קוד שגיאה {status}")
-            last_error = f"Gemini Key #{i + 1} HTTP {status}"
+            err_body = e.read().decode('utf-8', errors='ignore')
+            print(f"⚠️ מפתח Gemini #{i + 1} נכשל עם קוד שגיאה {e.code}: {err_body}")
+            last_error = f"Gemini Key #{i + 1} HTTP {e.code}: {err_body}"
             continue
         except Exception as e:
             print(f"⚠️ מפתח Gemini #{i + 1} נכשל: {e}")
@@ -254,7 +254,6 @@ def main():
     github_token = os.environ["GITHUB_TOKEN"]
     groq_key = os.environ.get("GROQ_API_KEY", "")
 
-    # איסוף דינמי של כל מפתחות Gemini
     gemini_keys = []
     if os.environ.get("GEMINI_API_KEY"):
         gemini_keys.append(os.environ["GEMINI_API_KEY"].strip())
@@ -268,13 +267,18 @@ def main():
     repo_name = os.environ["REPO_NAME"]
     issue_number = int(os.environ["ISSUE_NUMBER"])
 
-    # טעינת נתוני ה-Issue
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
-    # איסוף טקסט הדיון כדי לזהות שמות קבצים רלוונטיים
-    issue_text_accumulator = f"{issue_data.get('title', '')} {issue_data.get('body') or ''}"
+    # סינון תגובות שגיאה של הבוט
+    valid_comments = []
     for comment in comments_data:
+        body = comment.get("body") or ""
+        if not body.strip().startswith("⚠️"):
+            valid_comments.append(comment)
+
+    issue_text_accumulator = f"{issue_data.get('title', '')} {issue_data.get('body') or ''}"
+    for comment in valid_comments:
         issue_text_accumulator += f" {comment.get('body') or ''}"
 
     repo_tree, repo_files_content = get_repo_files_and_content(issue_text_accumulator)
@@ -286,12 +290,28 @@ def main():
     )
     
     initial_user_msg = context_prefix + f"Issue #{issue_number} Title: {issue_data.get('title', '')}\n\n{issue_data.get('body') or ''}"
-    conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     
-    for comment in comments_data:
+    # בניית היסטוריית השיחה בצורה חוקית ומסודרת
+    raw_conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
+    for comment in valid_comments:
         author = comment.get("user", {}).get("login", "")
         role = "model" if author.endswith("[bot]") or author == "github-actions[bot]" else "user"
-        conversation.append({"role": role, "parts": [{"text": comment.get("body") or ""}]})
+        raw_conversation.append({"role": role, "parts": [{"text": comment.get("body") or ""}]})
+
+    # מיזוג תורות רצופים של אותו תפקיד
+    conversation = []
+    for msg in raw_conversation:
+        if conversation and conversation[-1]["role"] == msg["role"]:
+            conversation[-1]["parts"][0]["text"] += "\n\n" + msg["parts"][0]["text"]
+        else:
+            conversation.append(msg)
+
+    # וידוא קריטי: השיחה חייבת להסתיים תמיד בתור של 'user'!
+    while conversation and conversation[-1]["role"] != "user":
+        conversation.pop()
+
+    if not conversation:
+        conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
     system_instruction = """
     You are an autonomous AI software engineer operating inside this GitHub repository.

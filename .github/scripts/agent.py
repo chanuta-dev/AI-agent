@@ -6,11 +6,11 @@ import urllib.request
 import urllib.error
 import time
 
-# רשימת המודלים של גוגל לפי סדר עדיפות
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
+# רשימת המודלים של גוגל לפי סדר עדיפות ויציבות (3.6 הומלץ רשמית על ידי גוגל)
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
 
 def extract_json(raw_text):
-    """מחלץ אובייקט JSON מתוך טקסט חופשי (כולל תמיכה ב-Markdown או טקסט נלווה)."""
+    """מחלץ אובייקט JSON בצורה עמידה מתוך טקסט (כולל ניקוי Markdown ותיקון שגיאות קלות)."""
     text = raw_text.strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
@@ -24,11 +24,14 @@ def extract_json(raw_text):
     try:
         return json.loads(text)
     except Exception:
-        # ניסיון חיפוש נוסף לפי ביטוי רגולרי
+        # ניסיון חילוץ נוסף באמצעות Regex רחב
         json_match = re.search(r'\{[\s\S]*\}', text)
         if json_match:
-            return json.loads(json_match.group(0))
-        raise
+            try:
+                return json.loads(json_match.group(0))
+            except Exception:
+                pass
+        raise ValueError(f"לא ניתן לפענח JSON מהפלט שהתקבל: {text[:250]}")
 
 def github_api_request(url, token, data=None, method="GET"):
     """קריאה ישירה ל-GitHub REST API ללא ספריות כבדות."""
@@ -45,7 +48,7 @@ def github_api_request(url, token, data=None, method="GET"):
         return json.loads(resp.read().decode())
 
 def build_file_tree(file_list, max_depth=3):
-    """מייצר עץ קבצים היררכי חכם בסגנון TREE /F עם הגבלת עומק כדי לא להעמיס טוקנים."""
+    """מייצר עץ קבצים היררכי חכם בסגנון TREE /F עם הגבלת עומק."""
     tree = {}
     for path in sorted(file_list):
         normalized = path.replace("\\", "/")
@@ -71,14 +74,15 @@ def build_file_tree(file_list, max_depth=3):
     return "\n".join(render(tree))
 
 def get_repo_files_and_content(issue_context_text=""):
-    """סורק את קבצי הפרויקט, מייצר עץ TREE /F קומפקטי וטוען קבצים רלוונטיים."""
+    """סורק את קבצי הפרויקט, מייצר עץ TREE /F וטוען קבצים בתקציב ששומר על Groq ו-Gemini."""
     repo_files = {}
     file_list = []
     
     IGNORE_DIRS = {'.git', '__pycache__', '.agent_core', 'node_modules', 'build', '.gradle', 'bin', 'out', '.idea', 'target', '.vscode'}
     VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties', '.html', '.css', '.cpp', '.h', '.c', '.go', '.rs')
     
-    MAX_TOTAL_CHARS = 35000
+    # תקציב של 22,000 תווים (כ-5,000 טוקנים) - מונע לחלוטין קריסות של 413 ו-429 ב-Groq
+    MAX_TOTAL_CHARS = 22000
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
@@ -115,7 +119,7 @@ def get_repo_files_and_content(issue_context_text=""):
             
         try:
             size = os.path.getsize(filepath)
-            if size < 15000 and (current_chars + size <= MAX_TOTAL_CHARS):
+            if size < 12000 and (current_chars + size <= MAX_TOTAL_CHARS):
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as fh:
                     content = fh.read()
                     repo_files[filepath] = content
@@ -128,24 +132,17 @@ def get_repo_files_and_content(issue_context_text=""):
     return repo_tree, repo_files
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
-    """קריאה ישירה ל-Gemini API עם סינון Thinking Mode וחילוף חלקים נכון."""
+    """קריאה ישירה ל-Gemini API עם שאיבת כל חלקי הטקסט בצורה תקינה."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
-    generation_config = {
-        "responseMimeType": "application/json",
-        "temperature": 0.2
-    }
-    
-    # הפחתת חשיבה כדי למנוע עומסי 503 ולהאיץ את התגובה
-    if "3." in model_name:
-        generation_config["thinkingConfig"] = {"thinkingLevel": "low"}
-    elif "2.5" in model_name:
-        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
-
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
-        "generationConfig": generation_config
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.2,
+            "maxOutputTokens": 8192
+        }
     }
     
     data = json.dumps(payload).encode('utf-8')
@@ -154,19 +151,23 @@ def call_gemini_api(api_key, model_name, contents, system_instruction):
     with urllib.request.urlopen(req, timeout=50) as response:
         res_data = json.loads(response.read().decode())
         candidate = res_data.get('candidates', [{}])[0]
-        content = candidate.get('content', {})
-        parts = content.get('parts', [])
+        parts = candidate.get('content', {}).get('parts', [])
         
-        # דילוג על חלקי ה-Thought ושליפת ה-JSON הסופי האמיתי
-        non_thought_parts = [p.get('text', '') for p in parts if not p.get('thought') and p.get('text')]
-        if non_thought_parts:
-            raw_text = non_thought_parts[-1]
-        elif parts:
-            raw_text = parts[-1].get('text', '')
-        else:
-            raise ValueError(f"לא התקבל תוכן מ-Gemini (סטטוס סיום: {candidate.get('finishReason')})")
+        # איסוף כל חלקי הטקסט (תוך התעלמות מחלקי מחשבה גולמיים אם ישנם)
+        text_chunks = []
+        for p in parts:
+            if isinstance(p, dict) and 'text' in p and not p.get('thought', False):
+                text_chunks.append(p['text'])
+        
+        # אם הכל סומן כמחשבה, קח את כל הטקסט
+        if not text_chunks:
+            text_chunks = [p.get('text', '') for p in parts if isinstance(p, dict) and 'text' in p]
             
-        return extract_json(raw_text)
+        full_text = "\n".join(text_chunks).strip()
+        if not full_text:
+            raise ValueError(f"Gemini החזיר פלט ריק (סטטוס סיום: {candidate.get('finishReason')})")
+            
+        return extract_json(full_text)
 
 def get_available_groq_models(groq_key):
     """שליפת רשימת המודלים הזמינים בזמן אמת מתוך חשבון ה-Groq."""
@@ -200,20 +201,15 @@ def get_available_groq_models(groq_key):
         return ["groq/compound", "groq/compound-mini", "openai/gpt-oss-120b"]
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי למודלים הזמינים ב-Groq עם קיצוץ בטוח למניעת TPM overflow."""
+    """קריאת גיבוי למודלים הזמינים ב-Groq עם ניהול השהיות חכם."""
     available_models = get_available_groq_models(groq_key)
     print(f"📋 מודלי Groq זמינים לחשבון (לפי סדר עדיפות): {available_models}")
     
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
-    
-    # קיצוץ עדין עבור Groq כדי להישאר בטוחים מתחת ל-30,000 TPM
     for c in contents:
         role = "assistant" if c["role"] == "model" else "user"
-        text = c["parts"][0]["text"]
-        if len(text) > 22000:
-            text = text[:22000] + "\n...[Content trimmed for backup model capacity]..."
-        messages.append({"role": role, "content": text})
+        messages.append({"role": role, "content": c["parts"][0]["text"]})
         
     headers = {
         'Content-Type': 'application/json',
@@ -261,7 +257,7 @@ def call_groq_api(groq_key, contents, system_instruction):
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון מעבר סדרתי מדורג: Gemini 3.8 -> Gemini 3.7 -> Gemini 2.5 -> Groq."""
+    """מנגנון מעבר סדרתי מדורג: Gemini 3.6 -> Gemini 3.8 -> Gemini 3.7 -> Groq."""
     last_error = None
 
     for model_name in GEMINI_MODELS:

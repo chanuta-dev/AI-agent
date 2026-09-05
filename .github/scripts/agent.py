@@ -6,11 +6,10 @@ import urllib.request
 import urllib.error
 import time
 
-# רק מודלים מגרסה 3.6 ומעלה לפי הדרישה הרשמית של גוגל
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def extract_json(raw_text):
-    """מחלץ אובייקט JSON בצורה עמידה מתוך טקסט (כולל ניקוי Markdown)."""
+    """מחלץ אובייקט JSON בצורה עמידה מתוך טקסט."""
     text = raw_text.strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
@@ -124,8 +123,6 @@ def get_repo_files_and_content(issue_context_text=""):
         except Exception:
             pass
 
-    print(f"🌲 נוצר עץ פרויקט קומפקטי עבור {len(file_list)} קבצי קוד מרכזיים.")
-    print(f"📊 נטענו {len(repo_files)} קבצים ({current_chars} תווים מתוך תקציב {MAX_TOTAL_CHARS}).")
     return repo_tree, repo_files
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
@@ -188,14 +185,11 @@ def get_available_groq_models(groq_key):
             filtered.sort(key=sort_key)
             return filtered if filtered else models
     except Exception as e:
-        print(f"⚠️ שגיאה בשליפת מודלי Groq דינמית: {e}")
         return ["groq/compound", "groq/compound-mini", "openai/gpt-oss-120b"]
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי למודלים הזמינים ב-Groq עם אפשרות המתנה של עד 35 שניות."""
+    """קריאת גיבוי למודלים הזמינים ב-Groq."""
     available_models = get_available_groq_models(groq_key)
-    print(f"📋 מודלי Groq זמינים לחשבון (לפי סדר עדיפות): {available_models}")
-    
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
     for c in contents:
@@ -212,7 +206,6 @@ def call_groq_api(groq_key, contents, system_instruction):
     for model in available_models:
         for attempt in range(2):
             try:
-                print(f"🔄 מנסה מודל Groq: {model} (ניסיון {attempt + 1})...")
                 payload = {
                     "model": model,
                     "messages": messages,
@@ -224,58 +217,46 @@ def call_groq_api(groq_key, contents, system_instruction):
                 with urllib.request.urlopen(req, timeout=40) as response:
                     res_data = json.loads(response.read().decode())
                     raw_text = res_data['choices'][0]['message']['content']
-                    print(f"✅ הצלחה עם Groq ({model})!")
                     return model, extract_json(raw_text)
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode('utf-8', errors='ignore')
-                print(f"⚠️ Groq ({model}) נכשל: HTTP {e.code} - {err_body}")
                 last_err = f"HTTP {e.code}: {err_body}"
-                
                 if e.code == 429 and attempt == 0:
                     match = re.search(r'try again in (\d+(\.\d+)?)s', err_body)
                     if match:
                         wait_sec = float(match.group(1)) + 2.0
                         if wait_sec <= 35:
-                            print(f"⏳ ממתין {wait_sec:.1f} שניות להתאפסות מכסת ה-TPM של Groq...")
                             time.sleep(wait_sec)
                             continue
                 break
             except Exception as e:
-                print(f"⚠️ Groq ({model}) נכשל: {e}")
                 last_err = e
                 break
 
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון מעבר סדרתי: Gemini 3.6 -> 3.8 -> 3.7 -> Groq."""
+    """מנגנון מעבר סדרתי על פני מודלים ומפתחות."""
     last_error = None
 
     for model_name in GEMINI_MODELS:
-        print(f"\n🚀 בודק מודל גוגל: {model_name} על פני {len(gemini_keys)} מפתחות...")
         for i, key in enumerate(gemini_keys):
             try:
-                print(f"🔄 מנסה {model_name} (מפתח #{i + 1} מתוך {len(gemini_keys)})...")
                 result = call_gemini_api(key, model_name, contents, system_instruction)
-                print(f"✅ הצלחה עם {model_name} (מפתח #{i + 1})!")
                 return f"{model_name} (מפתח #{i + 1})", result
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode('utf-8', errors='ignore')
-                print(f"⚠️ {model_name} מפתח #{i + 1} נכשל עם קוד {e.code}: {err_body}")
                 last_error = f"{model_name} Key #{i + 1} HTTP {e.code}: {err_body}"
                 continue
             except Exception as e:
-                print(f"⚠️ {model_name} מפתח #{i + 1} נכשל: {e}")
                 last_error = str(e)
                 continue
 
     if groq_key:
         try:
-            print("\n⚡ כל מודלי ומפתחות Gemini מוצו/עמוסים, מפעיל גיבוי Groq...")
             used_model, result = call_groq_api(groq_key, contents, system_instruction)
             return f"Groq ({used_model})", result
         except Exception as e:
-            print(f"⚠️ שגיאה ב-Groq: {e}")
             last_error = f"Groq Error: {e}"
 
     raise RuntimeError(f"כל הניסיונות נכשלו: {last_error}")
@@ -300,22 +281,22 @@ def main():
         if k and k not in gemini_keys:
             gemini_keys.append(k)
 
-    print(f"🔑 זוהו {len(gemini_keys)} מפתחות Gemini פעילים.")
-
     repo_name = os.environ["REPO_NAME"]
     issue_number = int(os.environ["ISSUE_NUMBER"])
 
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
-    # סינון הודעות שגיאה טכניות של הבוט בלבד
+    # שליפת הענף הראשי האמיתי (main או master)
+    repo_info = github_api_request(f"https://api.github.com/repos/{repo_name}", github_token)
+    default_branch = repo_info.get("default_branch", "main")
+
     valid_comments = []
     for comment in comments_data:
         body = comment.get("body") or ""
         if not body.strip().startswith("⚠️"):
             valid_comments.append(comment)
 
-    # 100% מכל היסטוריית הדיון נשמרת תמיד!
     issue_text_accumulator = f"{issue_data.get('title', '')} {issue_data.get('body') or ''}"
     for comment in valid_comments:
         issue_text_accumulator += f" {comment.get('body') or ''}"
@@ -324,13 +305,13 @@ def main():
     
     context_prefix = (
         f"[Repository: {repo_name}]\n"
+        f"[Default Branch: {default_branch}]\n"
         f"[Directory Tree (TREE /F):\n{repo_tree}\n]\n"
         f"[Loaded Files Content:\n{json.dumps(repo_files_content, ensure_ascii=False, indent=2)}]\n\n"
     )
     
     initial_user_msg = context_prefix + f"Issue #{issue_number} Title: {issue_data.get('title', '')}\n\n{issue_data.get('body') or ''}"
     
-    # כל התגובות שנכתבו בדיון מתחילתו נכנסות לכאן
     raw_conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     for comment in valid_comments:
         author = comment.get("user", {}).get("login", "")
@@ -350,39 +331,41 @@ def main():
     if not conversation:
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
-    system_instruction = """
-    You are an autonomous AI software engineer operating inside this GitHub repository.
+    # הנחיות מערכת מחודדות: מניעת קומיטים מיותרים כששואלים שאלות!
+    system_instruction = f"""
+    You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally, clearly, and helpfully in Hebrew.
     
-    CRITICAL WORKFLOW RULES:
-    1. ALWAYS return a VALID JSON object (no markdown code blocks around the JSON).
-    2. NEVER include `.github/workflows/` files in `files_to_update`. If suggesting workflow changes, explain them in `chat_response` and provide the exact YAML snippet for the user.
-    3. You CAN modify `.github/scripts/agent.py` and ALL application files directly via `files_to_update`.
+    CRITICAL DECISION RULE (CHAT vs COMMIT):
+    1. If the user asks a question (e.g. "איך", "למה", "מה לעשות", "איך משלבים"), requests guidance, explanation, status, or clarification:
+       YOU MUST RETURN action: "chat"! DO NOT commit files, DO NOT update summery_for_AI.md. Answer the user directly and helpfully in Hebrew!
+    2. ONLY use action: "commit" when the user explicitly requests you to write code, modify files, implement a feature, or fix a bug.
     
-    CRITICAL MEMORY & PROGRESS PROTOCOL RULES:
-    1. Always inspect `summery_for_AI.md` (if present in the repository) to understand the current architecture and project state.
-    2. On EVERY executed task or commit, always maintain and update the tasks/progress section in `summery_for_AI.md` with what was done and what remains.
+    WORKFLOW RULES:
+    1. ALWAYS return a VALID JSON object (no markdown blocks around the JSON).
+    2. NEVER include `.github/workflows/` in files_to_update.
+    3. When committing code, update the progress section in `summery_for_AI.md` if applicable.
     
-    IF CHATTING / EXPLAINING / BRAINSTORMING:
-    {
+    IF CHATTING / ANSWERING QUESTIONS / EXPLAINING:
+    {{
       "action": "chat",
       "chat_response": "Your natural markdown response in Hebrew"
-    }
+    }}
     
-    IF INSTRUCTED TO APPLY / COMMIT / EXECUTE:
-    {
+    IF INSTRUCTED TO MODIFY CODE / COMMIT:
+    {{
       "action": "commit",
       "chat_response": "Summary in Hebrew of the applied changes",
       "commit_message": "Clear Git commit message",
       "branch_name": "ai-feature-name",
       "files_to_update": [
-        {
+        {{
           "path": "path/to/file.ext",
           "content": "Full updated code/content"
-        }
+        }}
       ],
       "files_to_delete": []
-    }
+    }}
     """
 
     try:
@@ -422,6 +405,7 @@ def main():
             subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True)
             subprocess.run(["git", "push", "origin", branch, "--force"], check=True)
 
+            # פתיחת PR אמיתי מול הענף הראשי הנכון
             pr_title = f"🤖 AI Update: {response_data.get('commit_message')}"
             pr_body = f"Closes #{issue_number}\n\n{chat_reply}\n\n*Generated with {provider_used}*"
             
@@ -429,16 +413,17 @@ def main():
                 "title": pr_title,
                 "body": pr_body,
                 "head": branch,
-                "base": "main"
+                "base": default_branch
             }
             
             try:
                 res = github_api_request(f"https://api.github.com/repos/{repo_name}/pulls", github_token, data=pr_data, method="POST")
-                pr_url = res.get("html_url", f"https://github.com/{repo_name}/tree/{branch}")
-            except Exception:
+                pr_url = res.get("html_url")
+                summary = f"✨ **בוצע בהצלחה (באמצעות {provider_used})!**\n\n{chat_reply}\n\n🔗 **Pull Request מוכן למיזוג ל-{default_branch}:** {pr_url}"
+            except Exception as pr_err:
                 pr_url = f"https://github.com/{repo_name}/tree/{branch}"
+                summary = f"✨ **השינויים נדחפו לענף (באמצעות {provider_used})!**\n\n{chat_reply}\n\n⚠️ שים לב: פתיחת ה-PR האוטומטית נכשלה ({pr_err}).\n🔗 **קישור לענף:** {pr_url}"
 
-            summary = f"✨ **בוצע בהצלחה (באמצעות {provider_used})!**\n\n{chat_reply}\n\n🔗 **Pull Request מוכן:** {pr_url}"
             post_issue_comment(repo_name, issue_number, github_token, summary)
 
         except Exception as e:

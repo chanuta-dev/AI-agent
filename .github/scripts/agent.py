@@ -6,11 +6,11 @@ import urllib.request
 import urllib.error
 import time
 
-# רשימת המודלים של גוגל לפי סדר עדיפות ויציבות (3.6 הומלץ רשמית על ידי גוגל)
+# רק מודלים מגרסה 3.6 ומעלה לפי הדרישה הרשמית של גוגל
 GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
 
 def extract_json(raw_text):
-    """מחלץ אובייקט JSON בצורה עמידה מתוך טקסט (כולל ניקוי Markdown ותיקון שגיאות קלות)."""
+    """מחלץ אובייקט JSON בצורה עמידה מתוך טקסט (כולל ניקוי Markdown)."""
     text = raw_text.strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
@@ -24,14 +24,10 @@ def extract_json(raw_text):
     try:
         return json.loads(text)
     except Exception:
-        # ניסיון חילוץ נוסף באמצעות Regex רחב
         json_match = re.search(r'\{[\s\S]*\}', text)
         if json_match:
-            try:
-                return json.loads(json_match.group(0))
-            except Exception:
-                pass
-        raise ValueError(f"לא ניתן לפענח JSON מהפלט שהתקבל: {text[:250]}")
+            return json.loads(json_match.group(0))
+        raise ValueError(f"לא ניתן לפענח JSON מהפלט: {text[:200]}")
 
 def github_api_request(url, token, data=None, method="GET"):
     """קריאה ישירה ל-GitHub REST API ללא ספריות כבדות."""
@@ -48,13 +44,13 @@ def github_api_request(url, token, data=None, method="GET"):
         return json.loads(resp.read().decode())
 
 def build_file_tree(file_list, max_depth=3):
-    """מייצר עץ קבצים היררכי חכם בסגנון TREE /F עם הגבלת עומק."""
+    """מייצר עץ קבצים היררכי קומפקטי בסגנון TREE /F."""
     tree = {}
     for path in sorted(file_list):
         normalized = path.replace("\\", "/")
         parts = normalized.split("/")
         if len(parts) > max_depth + 1:
-            parts = parts[:max_depth] + [f"... ({len(parts) - max_depth} subdirs/files)"]
+            parts = parts[:max_depth] + [f"... ({len(parts) - max_depth} files)"]
         curr = tree
         for part in parts:
             curr = curr.setdefault(part, {})
@@ -74,19 +70,21 @@ def build_file_tree(file_list, max_depth=3):
     return "\n".join(render(tree))
 
 def get_repo_files_and_content(issue_context_text=""):
-    """סורק את קבצי הפרויקט, מייצר עץ TREE /F וטוען קבצים בתקציב ששומר על Groq ו-Gemini."""
+    """סורק קבצים וטוען את קבצי המפתח והקבצים שהוזכרו בדיון."""
     repo_files = {}
     file_list = []
     
-    IGNORE_DIRS = {'.git', '__pycache__', '.agent_core', 'node_modules', 'build', '.gradle', 'bin', 'out', '.idea', 'target', '.vscode'}
-    VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties', '.html', '.css', '.cpp', '.h', '.c', '.go', '.rs')
+    IGNORE_DIRS = {
+        '.git', '__pycache__', '.agent_core', 'node_modules', 'build', '.gradle', 
+        'bin', 'out', '.idea', 'target', '.vscode', 'res', 'drawable', 'mipmap'
+    }
+    VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties')
     
-    # תקציב של 22,000 תווים (כ-5,000 טוקנים) - מונע לחלוטין קריסות של 413 ו-429 ב-Groq
-    MAX_TOTAL_CHARS = 22000
+    MAX_TOTAL_CHARS = 25000
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.')]
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.') and not d.startswith('values-')]
         for f in files:
             filepath = os.path.normpath(os.path.join(root, f)).replace("\\", "/")
             if filepath.startswith("./"):
@@ -100,7 +98,6 @@ def get_repo_files_and_content(issue_context_text=""):
     def priority_score(filepath):
         score = 0
         fname = os.path.basename(filepath).lower()
-        
         if any(k in fname for k in ['summery_for_ai', 'summary_for_ai', 'project.md']):
             score += 200
         if fname in issue_words or os.path.splitext(fname)[0] in issue_words:
@@ -127,12 +124,12 @@ def get_repo_files_and_content(issue_context_text=""):
         except Exception:
             pass
 
-    print(f"🌲 נוצר עץ פרויקט קומפקטי עבור {len(file_list)} קבצים.")
-    print(f"📊 נטענו {len(repo_files)} קבצים רלוונטיים ({current_chars} תווים מתוך תקציב {MAX_TOTAL_CHARS}).")
+    print(f"🌲 נוצר עץ פרויקט קומפקטי עבור {len(file_list)} קבצי קוד מרכזיים.")
+    print(f"📊 נטענו {len(repo_files)} קבצים ({current_chars} תווים מתוך תקציב {MAX_TOTAL_CHARS}).")
     return repo_tree, repo_files
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
-    """קריאה ישירה ל-Gemini API עם שאיבת כל חלקי הטקסט בצורה תקינה."""
+    """קריאה ישירה ל-Gemini API עם Timeout מוגדל של 75 שניות."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     
     payload = {
@@ -148,24 +145,18 @@ def call_gemini_api(api_key, model_name, contents, system_instruction):
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     
-    with urllib.request.urlopen(req, timeout=50) as response:
+    with urllib.request.urlopen(req, timeout=75) as response:
         res_data = json.loads(response.read().decode())
         candidate = res_data.get('candidates', [{}])[0]
         parts = candidate.get('content', {}).get('parts', [])
         
-        # איסוף כל חלקי הטקסט (תוך התעלמות מחלקי מחשבה גולמיים אם ישנם)
-        text_chunks = []
-        for p in parts:
-            if isinstance(p, dict) and 'text' in p and not p.get('thought', False):
-                text_chunks.append(p['text'])
-        
-        # אם הכל סומן כמחשבה, קח את כל הטקסט
+        text_chunks = [p['text'] for p in parts if isinstance(p, dict) and 'text' in p and not p.get('thought', False)]
         if not text_chunks:
             text_chunks = [p.get('text', '') for p in parts if isinstance(p, dict) and 'text' in p]
             
         full_text = "\n".join(text_chunks).strip()
         if not full_text:
-            raise ValueError(f"Gemini החזיר פלט ריק (סטטוס סיום: {candidate.get('finishReason')})")
+            raise ValueError(f"Gemini החזיר פלט ריק (סטטוס: {candidate.get('finishReason')})")
             
         return extract_json(full_text)
 
@@ -201,7 +192,7 @@ def get_available_groq_models(groq_key):
         return ["groq/compound", "groq/compound-mini", "openai/gpt-oss-120b"]
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי למודלים הזמינים ב-Groq עם ניהול השהיות חכם."""
+    """קריאת גיבוי למודלים הזמינים ב-Groq עם אפשרות המתנה של עד 35 שניות."""
     available_models = get_available_groq_models(groq_key)
     print(f"📋 מודלי Groq זמינים לחשבון (לפי סדר עדיפות): {available_models}")
     
@@ -230,7 +221,7 @@ def call_groq_api(groq_key, contents, system_instruction):
                 data = json.dumps(payload).encode('utf-8')
                 req = urllib.request.Request(url, data=data, headers=headers)
                 
-                with urllib.request.urlopen(req, timeout=35) as response:
+                with urllib.request.urlopen(req, timeout=40) as response:
                     res_data = json.loads(response.read().decode())
                     raw_text = res_data['choices'][0]['message']['content']
                     print(f"✅ הצלחה עם Groq ({model})!")
@@ -243,8 +234,8 @@ def call_groq_api(groq_key, contents, system_instruction):
                 if e.code == 429 and attempt == 0:
                     match = re.search(r'try again in (\d+(\.\d+)?)s', err_body)
                     if match:
-                        wait_sec = float(match.group(1)) + 1.5
-                        if wait_sec <= 20:
+                        wait_sec = float(match.group(1)) + 2.0
+                        if wait_sec <= 35:
                             print(f"⏳ ממתין {wait_sec:.1f} שניות להתאפסות מכסת ה-TPM של Groq...")
                             time.sleep(wait_sec)
                             continue
@@ -257,7 +248,7 @@ def call_groq_api(groq_key, contents, system_instruction):
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון מעבר סדרתי מדורג: Gemini 3.6 -> Gemini 3.8 -> Gemini 3.7 -> Groq."""
+    """מנגנון מעבר סדרתי: Gemini 3.6 -> 3.8 -> 3.7 -> Groq."""
     last_error = None
 
     for model_name in GEMINI_MODELS:
@@ -317,12 +308,14 @@ def main():
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
+    # סינון הודעות שגיאה טכניות של הבוט בלבד
     valid_comments = []
     for comment in comments_data:
         body = comment.get("body") or ""
         if not body.strip().startswith("⚠️"):
             valid_comments.append(comment)
 
+    # 100% מכל היסטוריית הדיון נשמרת תמיד!
     issue_text_accumulator = f"{issue_data.get('title', '')} {issue_data.get('body') or ''}"
     for comment in valid_comments:
         issue_text_accumulator += f" {comment.get('body') or ''}"
@@ -337,6 +330,7 @@ def main():
     
     initial_user_msg = context_prefix + f"Issue #{issue_number} Title: {issue_data.get('title', '')}\n\n{issue_data.get('body') or ''}"
     
+    # כל התגובות שנכתבו בדיון מתחילתו נכנסות לכאן
     raw_conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     for comment in valid_comments:
         author = comment.get("user", {}).get("login", "")

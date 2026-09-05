@@ -7,7 +7,7 @@ import urllib.error
 import time
 
 # רשימת המודלים של גוגל לפי סדר עדיפות
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash"]
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
 
 def extract_json(raw_text):
     """מחלץ אובייקט JSON מתוך טקסט חופשי (כולל תמיכה ב-Markdown או טקסט נלווה)."""
@@ -20,7 +20,15 @@ def extract_json(raw_text):
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
             text = text[start:end + 1]
-    return json.loads(text)
+            
+    try:
+        return json.loads(text)
+    except Exception:
+        # ניסיון חיפוש נוסף לפי ביטוי רגולרי
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            return json.loads(json_match.group(0))
+        raise
 
 def github_api_request(url, token, data=None, method="GET"):
     """קריאה ישירה ל-GitHub REST API ללא ספריות כבדות."""
@@ -70,7 +78,7 @@ def get_repo_files_and_content(issue_context_text=""):
     IGNORE_DIRS = {'.git', '__pycache__', '.agent_core', 'node_modules', 'build', '.gradle', 'bin', 'out', '.idea', 'target', '.vscode'}
     VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties', '.html', '.css', '.cpp', '.h', '.c', '.go', '.rs')
     
-    MAX_TOTAL_CHARS = 35000  # תקציב טוקנים קבוע למניעת חריגות
+    MAX_TOTAL_CHARS = 35000
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
@@ -89,13 +97,10 @@ def get_repo_files_and_content(issue_context_text=""):
         score = 0
         fname = os.path.basename(filepath).lower()
         
-        # 1. קבצי זיכרון ותיעוד פרויקט מקבלים עדיפות עליונה תמיד
         if any(k in fname for k in ['summery_for_ai', 'summary_for_ai', 'project.md']):
             score += 200
-        # 2. אם הקובץ מוזכר ישירות ב-Issue
         if fname in issue_words or os.path.splitext(fname)[0] in issue_words:
             score += 100
-        # 3. קבצי הגדרות ובנייה מרכזיים
         if any(k in fname for k in ['readme', 'build.gradle', 'manifest', 'package.json', 'settings.gradle']):
             score += 50
         return score
@@ -123,23 +128,44 @@ def get_repo_files_and_content(issue_context_text=""):
     return repo_tree, repo_files
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
-    """קריאה ישירה ל-Gemini API עם מודל דינמי ו-Timeout מוגדל."""
+    """קריאה ישירה ל-Gemini API עם סינון Thinking Mode וחילוף חלקים נכון."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    
+    generation_config = {
+        "responseMimeType": "application/json",
+        "temperature": 0.2
+    }
+    
+    # הפחתת חשיבה כדי למנוע עומסי 503 ולהאיץ את התגובה
+    if "3." in model_name:
+        generation_config["thinkingConfig"] = {"thinkingLevel": "low"}
+    elif "2.5" in model_name:
+        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.2
-        }
+        "generationConfig": generation_config
     }
+    
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     
-    # הוגדל ל-50 שניות כדי למנוע The read operation timed out
     with urllib.request.urlopen(req, timeout=50) as response:
         res_data = json.loads(response.read().decode())
-        raw_text = res_data['candidates'][0]['content']['parts'][0]['text']
+        candidate = res_data.get('candidates', [{}])[0]
+        content = candidate.get('content', {})
+        parts = content.get('parts', [])
+        
+        # דילוג על חלקי ה-Thought ושליפת ה-JSON הסופי האמיתי
+        non_thought_parts = [p.get('text', '') for p in parts if not p.get('thought') and p.get('text')]
+        if non_thought_parts:
+            raw_text = non_thought_parts[-1]
+        elif parts:
+            raw_text = parts[-1].get('text', '')
+        else:
+            raise ValueError(f"לא התקבל תוכן מ-Gemini (סטטוס סיום: {candidate.get('finishReason')})")
+            
         return extract_json(raw_text)
 
 def get_available_groq_models(groq_key):
@@ -174,15 +200,20 @@ def get_available_groq_models(groq_key):
         return ["groq/compound", "groq/compound-mini", "openai/gpt-oss-120b"]
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי למודלים הזמינים ב-Groq עם מנגנון המתנה חכם למכסה."""
+    """קריאת גיבוי למודלים הזמינים ב-Groq עם קיצוץ בטוח למניעת TPM overflow."""
     available_models = get_available_groq_models(groq_key)
     print(f"📋 מודלי Groq זמינים לחשבון (לפי סדר עדיפות): {available_models}")
     
     url = "https://api.groq.com/openai/v1/chat/completions"
     messages = [{"role": "system", "content": system_instruction}]
+    
+    # קיצוץ עדין עבור Groq כדי להישאר בטוחים מתחת ל-30,000 TPM
     for c in contents:
         role = "assistant" if c["role"] == "model" else "user"
-        messages.append({"role": role, "content": c["parts"][0]["text"]})
+        text = c["parts"][0]["text"]
+        if len(text) > 22000:
+            text = text[:22000] + "\n...[Content trimmed for backup model capacity]..."
+        messages.append({"role": role, "content": text})
         
     headers = {
         'Content-Type': 'application/json',
@@ -192,7 +223,7 @@ def call_groq_api(groq_key, contents, system_instruction):
 
     last_err = None
     for model in available_models:
-        for attempt in range(2):  # עד 2 ניסיונות למודל אם נדרשת המתנה קצרה
+        for attempt in range(2):
             try:
                 print(f"🔄 מנסה מודל Groq: {model} (ניסיון {attempt + 1})...")
                 payload = {
@@ -213,7 +244,6 @@ def call_groq_api(groq_key, contents, system_instruction):
                 print(f"⚠️ Groq ({model}) נכשל: HTTP {e.code} - {err_body}")
                 last_err = f"HTTP {e.code}: {err_body}"
                 
-                # אם המודל ביקש המתנה קצרה להתאפסות המכסה (עד 20 שניות)
                 if e.code == 429 and attempt == 0:
                     match = re.search(r'try again in (\d+(\.\d+)?)s', err_body)
                     if match:
@@ -231,10 +261,9 @@ def call_groq_api(groq_key, contents, system_instruction):
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון מעבר עמיד: בדיקת Gemini 3.8 על כל המפתחות -> בדיקת Gemini 3.7 על כל המפתחות -> Groq."""
+    """מנגנון מעבר סדרתי מדורג: Gemini 3.8 -> Gemini 3.7 -> Gemini 2.5 -> Groq."""
     last_error = None
 
-    # 1. מעבר על מודלי Gemini (3.8 קודם, ואז 3.7)
     for model_name in GEMINI_MODELS:
         print(f"\n🚀 בודק מודל גוגל: {model_name} על פני {len(gemini_keys)} מפתחות...")
         for i, key in enumerate(gemini_keys):
@@ -253,7 +282,6 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
                 last_error = str(e)
                 continue
 
-    # 2. מעבר אוטומטי ל-Groq אם כל מודלי ומפתחות Gemini כשלו
     if groq_key:
         try:
             print("\n⚡ כל מודלי ומפתחות Gemini מוצו/עמוסים, מפעיל גיבוי Groq...")
@@ -293,7 +321,6 @@ def main():
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
-    # סינון הודעות שגיאה של הבוט
     valid_comments = []
     for comment in comments_data:
         body = comment.get("body") or ""

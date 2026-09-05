@@ -7,7 +7,7 @@ import urllib.error
 import time
 
 # רק מודלים מגרסה 3.6 ומעלה לפי הדרישה הרשמית של גוגל
-GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def extract_json(raw_text):
     """מחלץ אובייקט JSON בצורה עמידה מתוך טקסט (כולל ניקוי Markdown)."""

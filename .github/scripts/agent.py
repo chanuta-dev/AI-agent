@@ -6,11 +6,14 @@ import urllib.request
 import urllib.error
 import time
 
-GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def extract_json(raw_text):
+    """מחלץ אובייקט JSON נקי ובטוח ללא פגיעה בקוד Kotlin/Java."""
     text = raw_text.strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    
+    # 1. חילוץ מתוך בלוק Markdown אם יש
+    match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
     if match:
         text = match.group(1).strip()
     else:
@@ -19,17 +22,13 @@ def extract_json(raw_text):
         if start != -1 and end != -1 and end > start:
             text = text[start:end + 1]
             
-    text = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)', r'\1"\2"\3', text)
-    
     try:
-        # strict=False מאפשר שורות חדשות אמיתיות בתוך המחרוזת (קריטי לקוד!)
+        # strict=False מאפשר שורות חדשות ורווחים בקוד בצורה חוקית
         return json.loads(text, strict=False)
-    except Exception as e:
-        # רשת ביטחון: אם ה-JSON שבור לגמרי בגלל מרכאות, נדפיס אותו כצ'אט כדי שהמשתמש יראה את הקוד!
-        return {
-            "action": "chat",
-            "chat_response": f"⚠️ **שגיאת תחביר ביצירת הקוד:** יצרתי את הפתרון, אך נוצרה שגיאת JSON פנימית (כנראה מרכאות לא שמורות בתוך הקוד). הנה הפלט המלא שרציתי לשלוח לך כדי שתוכל להעתיק את הקוד ידנית:\n\n```json\n{text}\n```"
-        }
+    except Exception:
+        # רשת ביטחון במקרה קיצוני של כישלון
+        safe_text = json.dumps(raw_text)
+        return json.loads(f'{{"action": "chat", "chat_response": {safe_text}}}', strict=False)
 
 def github_api_request(url, token, data=None, method="GET"):
     headers = {
@@ -186,18 +185,15 @@ def get_available_groq_models(groq_key):
 
 def call_groq_api(groq_key, contents, system_instruction):
     available_models = get_available_groq_models(groq_key)
-    print(f"📋 מודלי Groq: {available_models}", flush=True)
-    
     url = "https://api.groq.com/openai/v1/chat/completions"
     safe_messages = [{"role": "system", "content": system_instruction}]
     
-    # הבטחת יציבות ב-Groq: לוקח רק את 3 ההודעות האחרונות בשרשור ומקצץ ל-4000 תווים!
     recent_contents = contents[-3:] if len(contents) > 3 else contents
     for c in recent_contents:
         role = "assistant" if c["role"] == "model" else "user"
         text = c["parts"][0]["text"]
         if len(text) > 4000:
-            text = text[:4000] + "\n\n...[הטקסט קוצץ עקב מגבלת הזיכרון של מודל הגיבוי]..."
+            text = text[:4000] + "\n\n...[הטקסט קוצץ עקב מגבלת זיכרון]..."
         safe_messages.append({"role": role, "content": text})
         
     headers = {
@@ -210,7 +206,6 @@ def call_groq_api(groq_key, contents, system_instruction):
     for model in available_models:
         for attempt in range(2):
             try:
-                print(f"🔄 מנסה מודל Groq: {model}...", flush=True)
                 payload = {
                     "model": model,
                     "messages": safe_messages,
@@ -245,7 +240,6 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
     for model_name in GEMINI_MODELS:
         for i, key in enumerate(gemini_keys):
             try:
-                print(f"🔄 מנסה {model_name} (מפתח #{i + 1})...", flush=True)
                 result = call_gemini_api(key, model_name, contents, system_instruction)
                 return f"{model_name} (מפתח #{i + 1})", result, "\n".join(debug_log)
             except urllib.error.HTTPError as e:
@@ -335,16 +329,15 @@ def main():
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
     if conversation and conversation[-1]["role"] == "user":
-        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: You MUST output ONLY a valid JSON. You MUST escape all double quotes (\\\") and newlines (\\n) inside the code content field!]"
+        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: You MUST output ONLY a valid JSON. You MUST escape all double quotes (\\\") inside code strings!]"
 
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally in Hebrew.
     
     1. ALWAYS return a perfectly VALID JSON object.
-    2. NEVER return raw text or YAML. If writing YAML, put it inside the "chat_response" field.
+    2. NEVER return raw text or YAML outside the JSON structure.
     3. If committing code, ONLY include the files you are modifying or creating in `files_to_update`. 
-    4. CRITICAL: When putting code in the "content" field, you MUST correctly escape all double quotes (\\") and use \\n for newlines so the JSON does not break!
     
     Action Types:
     - "chat": For answering questions, explanations, or snippets.

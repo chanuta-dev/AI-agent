@@ -22,15 +22,14 @@ def extract_json(raw_text):
     text = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)', r'\1"\2"\3', text)
     
     try:
-        return json.loads(text)
-    except Exception:
-        json_match = re.search(r'\{[\s\S]*\}', text)
-        if json_match:
-            try:
-                return json.loads(json_match.group(0))
-            except Exception:
-                pass
-        raise ValueError(f"לא ניתן לפענח JSON מהפלט:\n{text[:250]}")
+        # strict=False מאפשר שורות חדשות אמיתיות בתוך המחרוזת (קריטי לקוד!)
+        return json.loads(text, strict=False)
+    except Exception as e:
+        # רשת ביטחון: אם ה-JSON שבור לגמרי בגלל מרכאות, נדפיס אותו כצ'אט כדי שהמשתמש יראה את הקוד!
+        return {
+            "action": "chat",
+            "chat_response": f"⚠️ **שגיאת תחביר ביצירת הקוד:** יצרתי את הפתרון, אך נוצרה שגיאת JSON פנימית (כנראה מרכאות לא שמורות בתוך הקוד). הנה הפלט המלא שרציתי לשלוח לך כדי שתוכל להעתיק את הקוד ידנית:\n\n```json\n{text}\n```"
+        }
 
 def github_api_request(url, token, data=None, method="GET"):
     headers = {
@@ -67,6 +66,7 @@ def build_file_tree(file_list, max_depth=3):
                 sub_prefix = prefix + ("    " if is_last else "│   ")
                 lines.extend(render(node[k], sub_prefix))
         return lines
+        
     return "\n".join(render(tree))
 
 def get_repo_files_and_content(issue_context_text=""):
@@ -78,6 +78,7 @@ def get_repo_files_and_content(issue_context_text=""):
         'bin', 'out', '.idea', 'target', '.vscode', 'res', 'drawable', 'mipmap'
     }
     VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties')
+    
     MAX_TOTAL_CHARS = 25000
     current_chars = 0
 
@@ -90,6 +91,7 @@ def get_repo_files_and_content(issue_context_text=""):
             file_list.append(filepath)
 
     repo_tree = build_file_tree(file_list, max_depth=3)
+
     issue_words = set(re.findall(r'[\w\.-]+', issue_context_text.lower()))
     
     def priority_score(filepath):
@@ -120,6 +122,7 @@ def get_repo_files_and_content(issue_context_text=""):
                     current_chars += len(content)
         except Exception:
             pass
+
     return repo_tree, repo_files
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
@@ -148,7 +151,8 @@ def call_gemini_api(api_key, model_name, contents, system_instruction):
             
         full_text = "\n".join(text_chunks).strip()
         if not full_text:
-            raise ValueError(f"Gemini החזיר פלט ריק (סטטוס: {candidate.get('finishReason')})")
+            raise ValueError(f"Gemini החזיר פלט ריק")
+            
         return extract_json(full_text)
 
 def get_available_groq_models(groq_key):
@@ -182,15 +186,18 @@ def get_available_groq_models(groq_key):
 
 def call_groq_api(groq_key, contents, system_instruction):
     available_models = get_available_groq_models(groq_key)
+    print(f"📋 מודלי Groq: {available_models}", flush=True)
+    
     url = "https://api.groq.com/openai/v1/chat/completions"
     safe_messages = [{"role": "system", "content": system_instruction}]
     
-    recent_contents = contents[-5:] if len(contents) > 5 else contents
+    # הבטחת יציבות ב-Groq: לוקח רק את 3 ההודעות האחרונות בשרשור ומקצץ ל-4000 תווים!
+    recent_contents = contents[-3:] if len(contents) > 3 else contents
     for c in recent_contents:
         role = "assistant" if c["role"] == "model" else "user"
         text = c["parts"][0]["text"]
-        if len(text) > 8000:
-            text = text[:8000] + "\n\n...[הטקסט קוצץ עקב מגבלת זיכרון]..."
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n...[הטקסט קוצץ עקב מגבלת הזיכרון של מודל הגיבוי]..."
         safe_messages.append({"role": role, "content": text})
         
     headers = {
@@ -203,6 +210,7 @@ def call_groq_api(groq_key, contents, system_instruction):
     for model in available_models:
         for attempt in range(2):
             try:
+                print(f"🔄 מנסה מודל Groq: {model}...", flush=True)
                 payload = {
                     "model": model,
                     "messages": safe_messages,
@@ -229,6 +237,7 @@ def call_groq_api(groq_key, contents, system_instruction):
             except Exception as e:
                 last_err = e
                 break
+
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
@@ -236,6 +245,7 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
     for model_name in GEMINI_MODELS:
         for i, key in enumerate(gemini_keys):
             try:
+                print(f"🔄 מנסה {model_name} (מפתח #{i + 1})...", flush=True)
                 result = call_gemini_api(key, model_name, contents, system_instruction)
                 return f"{model_name} (מפתח #{i + 1})", result, "\n".join(debug_log)
             except urllib.error.HTTPError as e:
@@ -243,7 +253,7 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
                 debug_log.append(err_msg)
                 continue
             except Exception as e:
-                err_msg = f"{model_name} Key #{i + 1} שגיאה: {str(e)[:150]}"
+                err_msg = f"{model_name} Key #{i + 1} שגיאה: {str(e)[:400]}"
                 debug_log.append(err_msg)
                 continue
 
@@ -325,17 +335,20 @@ def main():
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
     if conversation and conversation[-1]["role"] == "user":
-        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL SYSTEM REMINDER: You MUST output ONLY a valid JSON object. Do not output raw YAML or code blocks outside the JSON structure!]"
+        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: You MUST output ONLY a valid JSON. You MUST escape all double quotes (\\\") and newlines (\\n) inside the code content field!]"
 
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally in Hebrew.
     
-    1. ALWAYS return a VALID JSON object (with "action" and "chat_response" keys).
-    2. NEVER return raw text or YAML. If writing YAML, put it inside the "chat_response" JSON field.
-    3. Action Types:
-       - Use "chat" for questions, explanations, or showing code snippets.
-       - Use "commit" ONLY when explicitly asked to write code/modify files in the repo.
+    1. ALWAYS return a perfectly VALID JSON object.
+    2. NEVER return raw text or YAML. If writing YAML, put it inside the "chat_response" field.
+    3. If committing code, ONLY include the files you are modifying or creating in `files_to_update`. 
+    4. CRITICAL: When putting code in the "content" field, you MUST correctly escape all double quotes (\\") and use \\n for newlines so the JSON does not break!
+    
+    Action Types:
+    - "chat": For answering questions, explanations, or snippets.
+    - "commit": ONLY when asked to write code/modify files in the repo.
     """
 
     try:
@@ -345,7 +358,6 @@ def main():
         post_issue_comment(repo_name, issue_number, github_token, f"⚠️ המערכת בעומס. נסה שוב בעוד מספר דקות.{error_details}")
         return
 
-    # וידוא שפעולת ברירת המחדל היא chat
     if not isinstance(response_data, dict):
         response_data = {"action": "chat", "chat_response": str(response_data)}
         

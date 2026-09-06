@@ -6,36 +6,35 @@ import urllib.request
 import urllib.error
 import time
 
-# רשימת המודלים של גוגל לפי סדר: מהחדש ביותר לישן ביותר
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def extract_json(raw_text):
-    """מחלץ אובייקט JSON ומבצע תיקון אוטומטי לשגיאות תחביר נפוצות של ה-AI."""
+    """מחלץ אובייקט JSON עם 'כיפת ברזל': מתקן אוטומטית ועוטף פלט גולמי במידת הצורך."""
     text = raw_text.strip()
     
-    # 1. חילוץ מתוך בלוקי Markdown או טקסט עוטף
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    # 1. ניסיון לחלץ מתוך בלוק Markdown
+    match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
     if match:
         text = match.group(1).strip()
-    else:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start:end + 1]
-            
-    # 2. תיקון אוטומטי (Auto-Fix) אם ה-AI שכח מרכאות במפתחות (למשל { action: "chat" } -> { "action": "chat" })
-    text = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)', r'\1"\2"\3', text)
+        
+    start = text.find("{")
+    end = text.rfind("}")
     
-    try:
-        return json.loads(text)
-    except Exception:
-        json_match = re.search(r'\{[\s\S]*\}', text)
-        if json_match:
-            try:
-                return json.loads(json_match.group(0))
-            except Exception:
-                pass
-        raise ValueError(f"לא ניתן לפענח JSON מהפלט:\n{text[:250]}")
+    if start != -1 and end != -1 and end > start:
+        json_candidate = text[start:end + 1]
+        # תיקון שגיאות נפוצות: מרכאות חסרות במפתחות
+        json_candidate = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)', r'\1"\2"\3', json_candidate)
+        try:
+            return json.loads(json_candidate)
+        except Exception:
+            pass
+            
+    # 2. חגורת הצלה (FOOLPROOF FALLBACK): 
+    # ה-AI שכח לכתוב JSON ופשוט זרק קוד/טקסט גולמי (זליגת פורמט).
+    # נתפוס את הטקסט שלו ונעטוף אותו ידנית כדי שהריצה לעולם לא תקרוס!
+    safe_text = json.dumps(raw_text)
+    fallback_json = f'{{"action": "chat", "chat_response": {safe_text}}}'
+    return json.loads(fallback_json)
 
 def github_api_request(url, token, data=None, method="GET"):
     headers = {
@@ -174,12 +173,18 @@ def get_available_groq_models(groq_key):
             models = [m["id"] for m in data.get("data", [])]
             filtered = [m for m in models if not any(bad in m.lower() for bad in ["whisper", "guard", "tts", "vision", "orpheus"])]
             
-            priority_keywords = ["compound", "120b", "3.8", "3.6", "27b", "20b", "allam"]
             def sort_key(model_id):
-                for idx, kw in enumerate(priority_keywords):
-                    if kw in model_id.lower():
-                        return idx
-                return len(priority_keywords)
+                mid = model_id.lower()
+                # עדיפות מפורשת ומוחלטת ל-compound המלא ולמודלים חזקים, הורדת mini למטה
+                if mid == "groq/compound": return 0
+                if "120b" in mid: return 1
+                if "3.8" in mid: return 2
+                if "3.6" in mid: return 3
+                if "27b" in mid: return 4
+                if "20b" in mid: return 5
+                if "compound-mini" in mid: return 6
+                if "allam" in mid: return 7
+                return 50
             
             filtered.sort(key=sort_key)
             return filtered if filtered else models
@@ -193,8 +198,6 @@ def call_groq_api(groq_key, contents, system_instruction):
     url = "https://api.groq.com/openai/v1/chat/completions"
     safe_messages = [{"role": "system", "content": system_instruction}]
     
-    # חיתוך אגרסיבי במעבר ל-Groq למניעת שגיאת "Context Length Exceeded"
-    # לוקחים רק את 5 ההודעות האחרונות בדיון ומוודאים שהן קצרות!
     recent_contents = contents[-5:] if len(contents) > 5 else contents
     for c in recent_contents:
         role = "assistant" if c["role"] == "model" else "user"
@@ -343,7 +346,6 @@ def main():
     if not conversation:
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
-    # הזרקת תזכורת נוקשה להודעה האחרונה כדי לכפות פלט JSON תקני!
     if conversation and conversation[-1]["role"] == "user":
         conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL SYSTEM REMINDER: You MUST output ONLY a valid JSON object. Do not output raw YAML, code blocks, or markdown outside the JSON structure. If you write YAML, put it inside the 'chat_response' JSON string field!]"
 

@@ -6,10 +6,14 @@ import urllib.request
 import urllib.error
 import time
 
-GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
+# רשימת המודלים של גוגל לפי סדר: מהחדש ביותר לישן ביותר
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def extract_json(raw_text):
+    """מחלץ אובייקט JSON ומבצע תיקון אוטומטי לשגיאות תחביר נפוצות של ה-AI."""
     text = raw_text.strip()
+    
+    # 1. חילוץ מתוך בלוקי Markdown או טקסט עוטף
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
         text = match.group(1).strip()
@@ -19,13 +23,19 @@ def extract_json(raw_text):
         if start != -1 and end != -1 and end > start:
             text = text[start:end + 1]
             
+    # 2. תיקון אוטומטי (Auto-Fix) אם ה-AI שכח מרכאות במפתחות (למשל { action: "chat" } -> { "action": "chat" })
+    text = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)', r'\1"\2"\3', text)
+    
     try:
         return json.loads(text)
     except Exception:
         json_match = re.search(r'\{[\s\S]*\}', text)
         if json_match:
-            return json.loads(json_match.group(0))
-        raise ValueError(f"לא ניתן לפענח JSON מהפלט: {text[:200]}")
+            try:
+                return json.loads(json_match.group(0))
+            except Exception:
+                pass
+        raise ValueError(f"לא ניתן לפענח JSON מהפלט:\n{text[:250]}")
 
 def github_api_request(url, token, data=None, method="GET"):
     headers = {
@@ -75,7 +85,7 @@ def get_repo_files_and_content(issue_context_text=""):
     }
     VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties')
     
-    MAX_TOTAL_CHARS = 20000
+    MAX_TOTAL_CHARS = 25000
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
@@ -87,8 +97,6 @@ def get_repo_files_and_content(issue_context_text=""):
             file_list.append(filepath)
 
     repo_tree = build_file_tree(file_list, max_depth=3)
-    if len(repo_tree) > 10000:
-        repo_tree = repo_tree[:10000] + "\n...[עץ הקבצים קוצץ עקב מגבלת אורך]..."
 
     issue_words = set(re.findall(r'[\w\.-]+', issue_context_text.lower()))
     
@@ -121,7 +129,6 @@ def get_repo_files_and_content(issue_context_text=""):
         except Exception:
             pass
 
-    print(f"🌲 נוצר עץ פרויקט עבור {len(file_list)} קבצים.", flush=True)
     return repo_tree, repo_files
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
@@ -184,14 +191,16 @@ def call_groq_api(groq_key, contents, system_instruction):
     print(f"📋 מודלי Groq: {available_models}", flush=True)
     
     url = "https://api.groq.com/openai/v1/chat/completions"
-    
-    # חיתוך אגרסיבי במעבר ל-Groq כדי למנוע את שגיאת 400/413
     safe_messages = [{"role": "system", "content": system_instruction}]
-    for c in contents:
+    
+    # חיתוך אגרסיבי במעבר ל-Groq למניעת שגיאת "Context Length Exceeded"
+    # לוקחים רק את 5 ההודעות האחרונות בדיון ומוודאים שהן קצרות!
+    recent_contents = contents[-5:] if len(contents) > 5 else contents
+    for c in recent_contents:
         role = "assistant" if c["role"] == "model" else "user"
         text = c["parts"][0]["text"]
-        if len(text) > 12000:
-            text = text[:12000] + "\n\n...[הטקסט קוצץ עקב מגבלת הזיכרון של מודל הגיבוי]..."
+        if len(text) > 8000:
+            text = text[:8000] + "\n\n...[הטקסט קוצץ עקב מגבלת הזיכרון של מודל הגיבוי]..."
         safe_messages.append({"role": role, "content": text})
         
     headers = {
@@ -249,7 +258,7 @@ def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instructio
                 debug_log.append(err_msg)
                 continue
             except Exception as e:
-                err_msg = f"{model_name} Key #{i + 1} שגיאה: {e}"
+                err_msg = f"{model_name} Key #{i + 1} שגיאה: {str(e)[:150]}"
                 print(f"⚠️ {err_msg}", flush=True)
                 debug_log.append(err_msg)
                 continue
@@ -334,20 +343,24 @@ def main():
     if not conversation:
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
+    # הזרקת תזכורת נוקשה להודעה האחרונה כדי לכפות פלט JSON תקני!
+    if conversation and conversation[-1]["role"] == "user":
+        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL SYSTEM REMINDER: You MUST output ONLY a valid JSON object. Do not output raw YAML, code blocks, or markdown outside the JSON structure. If you write YAML, put it inside the 'chat_response' JSON string field!]"
+
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally, clearly, and helpfully in Hebrew.
     
     CRITICAL DECISION RULE (CHAT vs COMMIT):
-    1. If the user asks a question, requests guidance, explanation, status, or clarification:
-       YOU MUST RETURN action: "chat"! DO NOT commit files. Answer the user directly and helpfully in Hebrew!
+    1. If the user asks a question, requests guidance, explanation, status, or clarification (e.g., "איך יוצרים", "תסביר"):
+       YOU MUST RETURN action: "chat"! DO NOT commit files. Provide the instructions/YAML snippet inside 'chat_response'.
     2. ONLY use action: "commit" when the user explicitly requests you to write code, modify files, implement a feature, or fix a bug.
     
     WORKFLOW RULES:
-    1. ALWAYS return a VALID JSON object (no markdown blocks around the JSON).
-    2. NEVER include `.github/workflows/` in files_to_update.
+    1. ALWAYS return a VALID JSON object.
+    2. NEVER include `.github/workflows/` in files_to_update. Provide workflow yaml in chat_response instead.
     
-    IF CHATTING / ANSWERING QUESTIONS / EXPLAINING:
+    IF CHATTING / ANSWERING QUESTIONS:
     {{
       "action": "chat",
       "chat_response": "Your natural markdown response in Hebrew"

@@ -6,10 +6,9 @@ import urllib.request
 import urllib.error
 import time
 
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
 
 def extract_json(raw_text):
-    """מחלץ אובייקט JSON בצורה עמידה מתוך טקסט."""
     text = raw_text.strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
@@ -29,7 +28,6 @@ def extract_json(raw_text):
         raise ValueError(f"לא ניתן לפענח JSON מהפלט: {text[:200]}")
 
 def github_api_request(url, token, data=None, method="GET"):
-    """קריאה ישירה ל-GitHub REST API ללא ספריות כבדות."""
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -43,7 +41,6 @@ def github_api_request(url, token, data=None, method="GET"):
         return json.loads(resp.read().decode())
 
 def build_file_tree(file_list, max_depth=3):
-    """מייצר עץ קבצים היררכי קומפקטי בסגנון TREE /F."""
     tree = {}
     for path in sorted(file_list):
         normalized = path.replace("\\", "/")
@@ -69,7 +66,6 @@ def build_file_tree(file_list, max_depth=3):
     return "\n".join(render(tree))
 
 def get_repo_files_and_content(issue_context_text=""):
-    """סורק קבצים וטוען את קבצי המפתח והקבצים שהוזכרו בדיון."""
     repo_files = {}
     file_list = []
     
@@ -79,7 +75,7 @@ def get_repo_files_and_content(issue_context_text=""):
     }
     VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties')
     
-    MAX_TOTAL_CHARS = 25000
+    MAX_TOTAL_CHARS = 20000
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
@@ -91,6 +87,8 @@ def get_repo_files_and_content(issue_context_text=""):
             file_list.append(filepath)
 
     repo_tree = build_file_tree(file_list, max_depth=3)
+    if len(repo_tree) > 10000:
+        repo_tree = repo_tree[:10000] + "\n...[עץ הקבצים קוצץ עקב מגבלת אורך]..."
 
     issue_words = set(re.findall(r'[\w\.-]+', issue_context_text.lower()))
     
@@ -123,12 +121,11 @@ def get_repo_files_and_content(issue_context_text=""):
         except Exception:
             pass
 
+    print(f"🌲 נוצר עץ פרויקט עבור {len(file_list)} קבצים.", flush=True)
     return repo_tree, repo_files
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
-    """קריאה ישירה ל-Gemini API עם Timeout מוגדל של 75 שניות."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -158,22 +155,17 @@ def call_gemini_api(api_key, model_name, contents, system_instruction):
         return extract_json(full_text)
 
 def get_available_groq_models(groq_key):
-    """שליפת רשימת המודלים הזמינים בזמן אמת מתוך חשבון ה-Groq."""
     url = "https://api.groq.com/openai/v1/models"
     headers = {
         'Authorization': f'Bearer {groq_key.strip()}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'User-Agent': 'Mozilla/5.0'
     }
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode())
             models = [m["id"] for m in data.get("data", [])]
-            
-            filtered = [
-                m for m in models 
-                if not any(bad in m.lower() for bad in ["whisper", "guard", "tts", "vision", "orpheus"])
-            ]
+            filtered = [m for m in models if not any(bad in m.lower() for bad in ["whisper", "guard", "tts", "vision", "orpheus"])]
             
             priority_keywords = ["compound", "120b", "3.8", "3.6", "27b", "20b", "allam"]
             def sort_key(model_id):
@@ -185,30 +177,37 @@ def get_available_groq_models(groq_key):
             filtered.sort(key=sort_key)
             return filtered if filtered else models
     except Exception as e:
-        return ["groq/compound", "groq/compound-mini", "openai/gpt-oss-120b"]
+        return ["groq/compound", "openai/gpt-oss-120b"]
 
 def call_groq_api(groq_key, contents, system_instruction):
-    """קריאת גיבוי למודלים הזמינים ב-Groq."""
     available_models = get_available_groq_models(groq_key)
+    print(f"📋 מודלי Groq: {available_models}", flush=True)
+    
     url = "https://api.groq.com/openai/v1/chat/completions"
-    messages = [{"role": "system", "content": system_instruction}]
+    
+    # חיתוך אגרסיבי במעבר ל-Groq כדי למנוע את שגיאת 400/413
+    safe_messages = [{"role": "system", "content": system_instruction}]
     for c in contents:
         role = "assistant" if c["role"] == "model" else "user"
-        messages.append({"role": role, "content": c["parts"][0]["text"]})
+        text = c["parts"][0]["text"]
+        if len(text) > 12000:
+            text = text[:12000] + "\n\n...[הטקסט קוצץ עקב מגבלת הזיכרון של מודל הגיבוי]..."
+        safe_messages.append({"role": role, "content": text})
         
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {groq_key.strip()}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'User-Agent': 'Mozilla/5.0'
     }
 
     last_err = None
     for model in available_models:
         for attempt in range(2):
             try:
+                print(f"🔄 מנסה מודל Groq: {model}...", flush=True)
                 payload = {
                     "model": model,
-                    "messages": messages,
+                    "messages": safe_messages,
                     "temperature": 0.2
                 }
                 data = json.dumps(payload).encode('utf-8')
@@ -225,7 +224,7 @@ def call_groq_api(groq_key, contents, system_instruction):
                     match = re.search(r'try again in (\d+(\.\d+)?)s', err_body)
                     if match:
                         wait_sec = float(match.group(1)) + 2.0
-                        if wait_sec <= 35:
+                        if wait_sec <= 20:
                             time.sleep(wait_sec)
                             continue
                 break
@@ -236,38 +235,43 @@ def call_groq_api(groq_key, contents, system_instruction):
     raise RuntimeError(f"כל מודלי Groq נכשלו: {last_err}")
 
 def generate_with_smart_retry(gemini_keys, groq_key, contents, system_instruction):
-    """מנגנון מעבר סדרתי על פני מודלים ומפתחות."""
-    last_error = None
-
+    debug_log = []
+    
     for model_name in GEMINI_MODELS:
         for i, key in enumerate(gemini_keys):
             try:
+                print(f"🔄 מנסה {model_name} (מפתח #{i + 1})...", flush=True)
                 result = call_gemini_api(key, model_name, contents, system_instruction)
-                return f"{model_name} (מפתח #{i + 1})", result
+                return f"{model_name} (מפתח #{i + 1})", result, "\n".join(debug_log)
             except urllib.error.HTTPError as e:
-                err_body = e.read().decode('utf-8', errors='ignore')
-                last_error = f"{model_name} Key #{i + 1} HTTP {e.code}: {err_body}"
+                err_msg = f"{model_name} Key #{i + 1} נכשל: HTTP {e.code}"
+                print(f"⚠️ {err_msg}", flush=True)
+                debug_log.append(err_msg)
                 continue
             except Exception as e:
-                last_error = str(e)
+                err_msg = f"{model_name} Key #{i + 1} שגיאה: {e}"
+                print(f"⚠️ {err_msg}", flush=True)
+                debug_log.append(err_msg)
                 continue
 
     if groq_key:
         try:
+            print("⚡ מפעיל גיבוי Groq...", flush=True)
             used_model, result = call_groq_api(groq_key, contents, system_instruction)
-            return f"Groq ({used_model})", result
+            return f"Groq ({used_model})", result, "\n".join(debug_log)
         except Exception as e:
-            last_error = f"Groq Error: {e}"
+            err_msg = f"Groq Error: {e}"
+            print(f"⚠️ {err_msg}", flush=True)
+            debug_log.append(err_msg)
 
-    raise RuntimeError(f"כל הניסיונות נכשלו: {last_error}")
+    raise RuntimeError(f"כל הניסיונות נכשלו.\nפירוט:\n" + "\n".join(debug_log))
 
 def post_issue_comment(repo_name, issue_number, token, body):
-    """שליחת תגובה ל-Issue."""
     url = f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments"
     try:
         github_api_request(url, token, data={"body": body}, method="POST")
     except Exception as e:
-        print(f"שגיאה בשליחת תגובה: {e}")
+        print(f"שגיאה בשליחת תגובה: {e}", flush=True)
 
 def main():
     github_token = os.environ["GITHUB_TOKEN"]
@@ -287,7 +291,6 @@ def main():
     issue_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}", github_token)
     comments_data = github_api_request(f"https://api.github.com/repos/{repo_name}/issues/{issue_number}/comments", github_token)
 
-    # שליפת הענף הראשי האמיתי (main או master)
     repo_info = github_api_request(f"https://api.github.com/repos/{repo_name}", github_token)
     default_branch = repo_info.get("default_branch", "main")
 
@@ -331,20 +334,18 @@ def main():
     if not conversation:
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
-    # הנחיות מערכת מחודדות: מניעת קומיטים מיותרים כששואלים שאלות!
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally, clearly, and helpfully in Hebrew.
     
     CRITICAL DECISION RULE (CHAT vs COMMIT):
-    1. If the user asks a question (e.g. "איך", "למה", "מה לעשות", "איך משלבים"), requests guidance, explanation, status, or clarification:
-       YOU MUST RETURN action: "chat"! DO NOT commit files, DO NOT update summery_for_AI.md. Answer the user directly and helpfully in Hebrew!
+    1. If the user asks a question, requests guidance, explanation, status, or clarification:
+       YOU MUST RETURN action: "chat"! DO NOT commit files. Answer the user directly and helpfully in Hebrew!
     2. ONLY use action: "commit" when the user explicitly requests you to write code, modify files, implement a feature, or fix a bug.
     
     WORKFLOW RULES:
     1. ALWAYS return a VALID JSON object (no markdown blocks around the JSON).
     2. NEVER include `.github/workflows/` in files_to_update.
-    3. When committing code, update the progress section in `summery_for_AI.md` if applicable.
     
     IF CHATTING / ANSWERING QUESTIONS / EXPLAINING:
     {{
@@ -369,9 +370,10 @@ def main():
     """
 
     try:
-        provider_used, response_data = generate_with_smart_retry(gemini_keys, groq_key, conversation, system_instruction)
+        provider_used, response_data, debug_log = generate_with_smart_retry(gemini_keys, groq_key, conversation, system_instruction)
     except Exception as e:
-        post_issue_comment(repo_name, issue_number, github_token, f"⚠️ המערכת בעומס זמני מול כל ה-APIs: {str(e)}")
+        error_details = f"\n\n<details><summary>🛠️ לחץ כאן לפירוט השגיאות מהשרתים</summary>\n\n```text\n{str(e)}\n```\n</details>"
+        post_issue_comment(repo_name, issue_number, github_token, f"⚠️ המערכת נמצאת כרגע בעומס מול כל מודלי ה-AI. אנא נסה שוב בעוד מספר דקות.{error_details}")
         return
 
     action = response_data.get("action", "chat")
@@ -405,7 +407,6 @@ def main():
             subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True)
             subprocess.run(["git", "push", "origin", branch, "--force"], check=True)
 
-            # פתיחת PR אמיתי מול הענף הראשי הנכון
             pr_title = f"🤖 AI Update: {response_data.get('commit_message')}"
             pr_body = f"Closes #{issue_number}\n\n{chat_reply}\n\n*Generated with {provider_used}*"
             

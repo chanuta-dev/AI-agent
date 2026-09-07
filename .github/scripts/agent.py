@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import time
 
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.7-flash"]
 
 def parse_agent_response(raw_text):
     """מפענח סופר-עמיד שמחלץ פעולות, קבצים ותגובות בכל תרחיש."""
@@ -244,8 +244,8 @@ def call_groq_api(groq_key, contents, system_instruction):
     for c in recent_contents:
         role = "assistant" if c["role"] == "model" else "user"
         text = c["parts"][0]["text"]
-        if len(text) > 3000:
-            text = text[:3000] + "\n\n...[הטקסט קוצץ]..."
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n...[הטקסט קוצץ]..."
         safe_messages.append({"role": role, "content": text})
         
     headers = {
@@ -317,7 +317,7 @@ def post_issue_comment(repo_name, issue_number, token, body):
     try:
         github_api_request(url, token, data={"body": body}, method="POST")
     except Exception as e:
-        print(f"שגיאה בשליחת תגובה: {e}", flush=True)
+        pass
 
 def main():
     github_token = os.environ["GITHUB_TOKEN"]
@@ -381,25 +381,34 @@ def main():
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
     if conversation and conversation[-1]["role"] == "user":
-        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: If the user approved or asked to implement, you MUST output action: 'commit' WITH the actual code files in files_to_update! Do not just chat about it!]"
+        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: If the user approved, YOU MUST ACTUALLY OUTPUT THE CODE in 'files_to_update'. Do not just say you did it!]"
 
-    # הנחיות חדות: איסור מוחלט על סיפורים בצ'אט אם המשתמש נתן אישור
+    # התיקון הקריטי: החזרת שבלונת ה-JSON כדי שהמודל ידע איך להחזיר את הקבצים ואת התגובה!
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally in Hebrew.
     
-    CRITICAL ANTI-LAZINESS & EXECUTION RULE:
-    1. If the user approved, gave green light, or asked to implement (e.g. "יש אישור", "בצע", "תממש", "קדימה"):
+    CRITICAL ANTI-LAZINESS RULE:
+    1. If the user approved, gave green light, or asked to implement (e.g. "יש אישור", "בצע", "קדימה"):
        YOU MUST RETURN action: "commit" AND YOU MUST PROVIDE THE ACTUAL CODE in `files_to_update`!
-    2. NEVER just say "It was implemented" or describe the code in chat without providing the actual files to commit. Talking without code is an error!
     
-    CRITICAL MEMORY & PROTOCOL RULES:
-    1. Always read `summery_for_AI.md` to understand current architecture and progress.
-    2. Whenever performing action "commit", you MUST ALWAYS include `summery_for_AI.md` inside `files_to_update` with an updated progress/tasks section documenting what you just implemented!
+    CRITICAL MEMORY RULE:
+    1. Whenever performing action "commit", you MUST ALWAYS include `summery_for_AI.md` inside `files_to_update` with an updated progress section documenting what you implemented.
     
-    Action Types:
-    - "chat": ONLY for answering questions or discussions when no code execution was requested.
-    - "commit": When asked to write code, modify files, or when approval was given.
+    OUTPUT FORMAT: You MUST return a VALID JSON object exactly like this:
+    {{
+      "action": "chat" OR "commit",
+      "chat_response": "Your detailed response in Hebrew explaining what you did.",
+      "commit_message": "Clear Git commit message (if commit)",
+      "branch_name": "ai-feature-name (if commit)",
+      "files_to_update": [
+        {{
+          "path": "path/to/file.ext",
+          "content": "Full updated code..."
+        }}
+      ],
+      "files_to_delete": []
+    }}
     """
 
     try:

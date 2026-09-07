@@ -9,9 +9,7 @@ import time
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def extract_json(raw_text):
-    """מחלץ אובייקט JSON נקי ובטוח ללא פגיעה בקוד."""
     text = raw_text.strip()
-    
     match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
     if match:
         text = match.group(1).strip()
@@ -123,20 +121,25 @@ def get_repo_files_and_content(issue_context_text=""):
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    
+    # פתיחת תקרת הפלט ל-65,536 טוקנים כדי למנוע קיטוע של קבצי קוד ארוכים
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
         "generationConfig": {
             "responseMimeType": "application/json",
             "temperature": 0.2,
-            "maxOutputTokens": 8192
+            "maxOutputTokens": 65536,
+            "thinkingConfig": {
+                "thinkingLevel": "low"
+            }
         }
     }
     
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     
-    with urllib.request.urlopen(req, timeout=75) as response:
+    with urllib.request.urlopen(req, timeout=90) as response:
         res_data = json.loads(response.read().decode())
         candidate = res_data.get('candidates', [{}])[0]
         parts = candidate.get('content', {}).get('parts', [])
@@ -147,7 +150,7 @@ def call_gemini_api(api_key, model_name, contents, system_instruction):
             
         full_text = "\n".join(text_chunks).strip()
         if not full_text:
-            raise ValueError(f"Gemini החזיר פלט ריק")
+            raise ValueError(f"Gemini החזיר פלט ריק (סטטוס סיום: {candidate.get('finishReason')})")
             
         return extract_json(full_text)
 
@@ -189,8 +192,8 @@ def call_groq_api(groq_key, contents, system_instruction):
     for c in recent_contents:
         role = "assistant" if c["role"] == "model" else "user"
         text = c["parts"][0]["text"]
-        if len(text) > 4000:
-            text = text[:4000] + "\n\n...[הטקסט קוצץ עקב מגבלת זיכרון]..."
+        if len(text) > 3000:
+            text = text[:3000] + "\n\n...[הטקסט קוצץ]..."
         safe_messages.append({"role": role, "content": text})
         
     headers = {
@@ -326,9 +329,8 @@ def main():
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
     if conversation and conversation[-1]["role"] == "user":
-        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: You MUST output ONLY a valid JSON. You MUST escape all double quotes (\\\") inside code strings!]"
+        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: You MUST output ONLY a complete, valid JSON object. Escape all quotes inside code. Always update summery_for_AI.md as well!]"
 
-    # הנחיות זיכרון מחודדות שמחייבות עדכון summery_for_AI.md בכל קומיט!
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally in Hebrew.
@@ -338,7 +340,7 @@ def main():
     2. Whenever performing action "commit", you MUST ALWAYS include `summery_for_AI.md` inside `files_to_update` with an updated progress/tasks section documenting what you just implemented!
     
     CRITICAL WORKFLOW RULES:
-    1. ALWAYS return a perfectly VALID JSON object.
+    1. ALWAYS return a complete, valid JSON object without markdown fences around it.
     2. In `chat_response`, provide a clear, detailed and helpful summary in Hebrew of what you did.
     3. Action Types:
        - "chat": For answering questions, explanations, or showing code snippets.

@@ -8,22 +8,86 @@ import time
 
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
-def extract_json(raw_text):
-    text = raw_text.strip()
-    match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
-    if match:
-        text = match.group(1).strip()
+def parse_agent_response(raw_text):
+    """
+    מפענח סופר-עמיד שמחלץ פעולות, קבצים ותגובות בכל תרחיש:
+    - תומך ב-JSON תקין (עם files_to_update כרשימה או כמילון).
+    - תומך ב-JSON שבור שבו יש מרכאות פנימיות בקוד Kotlin.
+    - תומך בבלוקי קוד Markdown נפרדים (*** FILE: path ***).
+    """
+    response_data = {}
+    files_to_update = []
+    
+    # 1. ניסיון פענוח JSON רגיל
+    json_obj = None
+    json_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_text)
+    candidate_text = json_match.group(1) if json_match else raw_text
+    
+    start = candidate_text.find("{")
+    end = candidate_text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            json_obj = json.loads(candidate_text[start:end + 1], strict=False)
+        except Exception:
+            pass
+
+    # 2. אם ה-JSON פוענח בהצלחה
+    if isinstance(json_obj, dict):
+        response_data = json_obj
+        raw_files = json_obj.get("files_to_update", [])
+        if isinstance(raw_files, dict):
+            for path, content in raw_files.items():
+                files_to_update.append({"path": path, "content": content})
+        elif isinstance(raw_files, list):
+            for item in raw_files:
+                if isinstance(item, dict) and "path" in item:
+                    files_to_update.append(item)
     else:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start:end + 1]
+        # 3. רשת ביטחון: חילוץ ישיר בעזרת Regex אם ה-JSON נשבר בגלל מרכאות ב-Kotlin
+        action_m = re.search(r'"action"\s*:\s*"([^"]+)"', raw_text)
+        action = action_m.group(1) if action_m else "chat"
+        
+        commit_m = re.search(r'"commit_message"\s*:\s*"([^"]+)"', raw_text)
+        commit_msg = commit_m.group(1) if commit_m else "AI auto-update"
+        
+        branch_m = re.search(r'"branch_name"\s*:\s*"([^"]+)"', raw_text)
+        branch_name = branch_m.group(1) if branch_m else None
+        
+        chat_m = re.search(r'"chat_response"\s*:\s*"([\s\S]*?)(?="\s*,\s*"[a-zA-Z_]+"|"\s*\}|$)', raw_text)
+        chat_response = chat_m.group(1) if chat_m else "השינויים בוצעו בהצלחה."
+        chat_response = chat_response.replace('\\n', '\n').replace('\\"', '"')
+        
+        response_data = {
+            "action": action,
+            "commit_message": commit_msg,
+            "branch_name": branch_name,
+            "chat_response": chat_response
+        }
+        
+        # חילוץ קבצים מתוך מבנה מילון: "path/to/file": "content..."
+        file_pattern = re.compile(
+            r'"([\w\./\-]+\.\w+)"\s*:\s*"([\s\S]*?)(?=",\s*"[\w\./\-]+\.\w+"\s*:|"\s*\}\s*,\s*"chat_response"|"\s*\}\s*$)',
+            re.MULTILINE
+        )
+        for match in file_pattern.finditer(raw_text):
+            fpath = match.group(1)
+            fcontent = match.group(2).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+            if not fpath.startswith(".github/workflows/"):
+                files_to_update.append({"path": fpath, "content": fcontent})
+
+    # 4. חילוץ קבצים מבלוקי Markdown (אם נכתבו כ-*** FILE: path *** או ### FILE: path)
+    block_pattern = re.compile(
+        r'(?:\*\*\*\s*FILE:\s*([^\s\*]+)\s*\*\*\*|###\s*FILE:\s*([^\n]+))\s*\n```[a-zA-Z]*\n([\s\S]*?)\n```',
+        re.MULTILINE
+    )
+    for match in block_pattern.finditer(raw_text):
+        fpath = (match.group(1) or match.group(2)).strip()
+        fcontent = match.group(3)
+        if not fpath.startswith(".github/workflows/"):
+            files_to_update.append({"path": fpath, "content": fcontent})
             
-    try:
-        return json.loads(text, strict=False)
-    except Exception:
-        safe_text = json.dumps(raw_text)
-        return json.loads(f'{{"action": "chat", "chat_response": {safe_text}}}', strict=False)
+    response_data["files_to_update"] = files_to_update
+    return response_data
 
 def github_api_request(url, token, data=None, method="GET"):
     headers = {
@@ -121,8 +185,6 @@ def get_repo_files_and_content(issue_context_text=""):
 
 def call_gemini_api(api_key, model_name, contents, system_instruction):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    
-    # פתיחת תקרת הפלט ל-65,536 טוקנים כדי למנוע קיטוע של קבצי קוד ארוכים
     payload = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
         "contents": contents,
@@ -150,9 +212,9 @@ def call_gemini_api(api_key, model_name, contents, system_instruction):
             
         full_text = "\n".join(text_chunks).strip()
         if not full_text:
-            raise ValueError(f"Gemini החזיר פלט ריק (סטטוס סיום: {candidate.get('finishReason')})")
+            raise ValueError(f"Gemini החזיר פלט ריק")
             
-        return extract_json(full_text)
+        return parse_agent_response(full_text)
 
 def get_available_groq_models(groq_key):
     url = "https://api.groq.com/openai/v1/models"
@@ -217,7 +279,7 @@ def call_groq_api(groq_key, contents, system_instruction):
                 with urllib.request.urlopen(req, timeout=40) as response:
                     res_data = json.loads(response.read().decode())
                     raw_text = res_data['choices'][0]['message']['content']
-                    return model, extract_json(raw_text)
+                    return model, parse_agent_response(raw_text)
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode('utf-8', errors='ignore')
                 last_err = f"HTTP {e.code}: {err_body}"
@@ -329,7 +391,7 @@ def main():
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
     if conversation and conversation[-1]["role"] == "user":
-        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: You MUST output ONLY a complete, valid JSON object. Escape all quotes inside code. Always update summery_for_AI.md as well!]"
+        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: Always include summery_for_AI.md in files_to_update with the updated progress log!]"
 
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
@@ -340,7 +402,7 @@ def main():
     2. Whenever performing action "commit", you MUST ALWAYS include `summery_for_AI.md` inside `files_to_update` with an updated progress/tasks section documenting what you just implemented!
     
     CRITICAL WORKFLOW RULES:
-    1. ALWAYS return a complete, valid JSON object without markdown fences around it.
+    1. Output a JSON object with your action, commit_message, branch_name, and files_to_update.
     2. In `chat_response`, provide a clear, detailed and helpful summary in Hebrew of what you did.
     3. Action Types:
        - "chat": For answering questions, explanations, or showing code snippets.
@@ -355,17 +417,22 @@ def main():
         return
 
     if not isinstance(response_data, dict):
-        response_data = {"action": "chat", "chat_response": str(response_data)}
+        response_data = {"action": "chat", "chat_response": str(response_data), "files_to_update": []}
         
     action = response_data.get("action", "chat")
     chat_reply = response_data.get("chat_response", "הפעולה בוצעה בהצלחה.")
+    files_to_update = response_data.get("files_to_update", [])
 
-    if action == "commit":
+    # אם יש קבצים לעדכון – זו פעולת קומיט בוודאות!
+    if files_to_update:
+        action = "commit"
+
+    if action == "commit" and files_to_update:
         try:
             branch = response_data.get("branch_name", f"ai-patch-issue-{issue_number}")
             subprocess.run(["git", "checkout", "-B", branch], check=True)
             
-            valid_files = [f for f in response_data.get("files_to_update", []) if not f["path"].startswith(".github/workflows/")]
+            valid_files = [f for f in files_to_update if not f["path"].startswith(".github/workflows/")]
             
             for item in valid_files:
                 filepath = item["path"]

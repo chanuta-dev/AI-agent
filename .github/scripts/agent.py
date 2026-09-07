@@ -121,17 +121,20 @@ def get_repo_files_and_content(issue_context_text=""):
     repo_files = {}
     file_list = []
     
+    # החרגת תיקיות זבל בלבד - ללא חסימת .github!
     IGNORE_DIRS = {
         '.git', '__pycache__', '.agent_core', 'node_modules', 'build', '.gradle', 
         'bin', 'out', '.idea', 'target', '.vscode', 'res', 'drawable', 'mipmap'
     }
-    VALID_EXTENSIONS = ('.py', '.java', '.kt', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties')
+    # הוספת תמיכה מפורשת ב-kts ובקובצי הגדרות אנדרואיד
+    VALID_EXTENSIONS = ('.py', '.java', '.kt', '.kts', '.json', '.md', '.yml', '.yaml', '.gradle', '.xml', '.ts', '.js', '.properties')
     
     MAX_TOTAL_CHARS = 25000
     current_chars = 0
 
     for root, dirs, files in os.walk("."):
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.') and not d.startswith('values-')]
+        # מאפשרים סריקה של .github אך חוסמים תיקיות מערכת אחרות
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and (not d.startswith('.') or d == '.github') and not d.startswith('values-')]
         for f in files:
             filepath = os.path.normpath(os.path.join(root, f)).replace("\\", "/")
             if filepath.startswith("./"):
@@ -149,8 +152,11 @@ def get_repo_files_and_content(issue_context_text=""):
             score += 200
         if fname in issue_words or os.path.splitext(fname)[0] in issue_words:
             score += 100
-        if any(k in fname for k in ['readme', 'build.gradle', 'manifest', 'package.json', 'settings.gradle']):
+        # עדיפות עליונה לקובצי קונפיגורציית בנייה ו-Workflows
+        if any(k in fname for k in ['readme', 'build.gradle', 'build.gradle.kts', 'manifest', 'package.json', 'settings.gradle']):
             score += 50
+        if '.github/workflows' in filepath:
+            score += 60
         return score
 
     prioritized_files = sorted(file_list, key=priority_score, reverse=True)
@@ -158,12 +164,12 @@ def get_repo_files_and_content(issue_context_text=""):
     for filepath in prioritized_files:
         if current_chars >= MAX_TOTAL_CHARS:
             break
-        if not filepath.endswith(VALID_EXTENSIONS):
+        if not any(filepath.endswith(ext) for ext in VALID_EXTENSIONS):
             continue
             
         try:
             size = os.path.getsize(filepath)
-            if size < 12000 and (current_chars + size <= MAX_TOTAL_CHARS):
+            if size < 15000 and (current_chars + size <= MAX_TOTAL_CHARS):
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as fh:
                     content = fh.read()
                     repo_files[filepath] = content

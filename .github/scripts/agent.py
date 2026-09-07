@@ -9,16 +9,10 @@ import time
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def parse_agent_response(raw_text):
-    """
-    מפענח סופר-עמיד שמחלץ פעולות, קבצים ותגובות בכל תרחיש:
-    - תומך ב-JSON תקין (עם files_to_update כרשימה או כמילון).
-    - תומך ב-JSON שבור שבו יש מרכאות פנימיות בקוד Kotlin.
-    - תומך בבלוקי קוד Markdown נפרדים (*** FILE: path ***).
-    """
+    """מפענח סופר-עמיד שמחלץ פעולות, קבצים ותגובות בכל תרחיש."""
     response_data = {}
     files_to_update = []
     
-    # 1. ניסיון פענוח JSON רגיל
     json_obj = None
     json_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_text)
     candidate_text = json_match.group(1) if json_match else raw_text
@@ -31,7 +25,6 @@ def parse_agent_response(raw_text):
         except Exception:
             pass
 
-    # 2. אם ה-JSON פוענח בהצלחה
     if isinstance(json_obj, dict):
         response_data = json_obj
         raw_files = json_obj.get("files_to_update", [])
@@ -43,7 +36,6 @@ def parse_agent_response(raw_text):
                 if isinstance(item, dict) and "path" in item:
                     files_to_update.append(item)
     else:
-        # 3. רשת ביטחון: חילוץ ישיר בעזרת Regex אם ה-JSON נשבר בגלל מרכאות ב-Kotlin
         action_m = re.search(r'"action"\s*:\s*"([^"]+)"', raw_text)
         action = action_m.group(1) if action_m else "chat"
         
@@ -64,7 +56,6 @@ def parse_agent_response(raw_text):
             "chat_response": chat_response
         }
         
-        # חילוץ קבצים מתוך מבנה מילון: "path/to/file": "content..."
         file_pattern = re.compile(
             r'"([\w\./\-]+\.\w+)"\s*:\s*"([\s\S]*?)(?=",\s*"[\w\./\-]+\.\w+"\s*:|"\s*\}\s*,\s*"chat_response"|"\s*\}\s*$)',
             re.MULTILINE
@@ -75,7 +66,6 @@ def parse_agent_response(raw_text):
             if not fpath.startswith(".github/workflows/"):
                 files_to_update.append({"path": fpath, "content": fcontent})
 
-    # 4. חילוץ קבצים מבלוקי Markdown (אם נכתבו כ-*** FILE: path *** או ### FILE: path)
     block_pattern = re.compile(
         r'(?:\*\*\*\s*FILE:\s*([^\s\*]+)\s*\*\*\*|###\s*FILE:\s*([^\n]+))\s*\n```[a-zA-Z]*\n([\s\S]*?)\n```',
         re.MULTILINE
@@ -391,22 +381,25 @@ def main():
         conversation = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
 
     if conversation and conversation[-1]["role"] == "user":
-        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: Always include summery_for_AI.md in files_to_update with the updated progress log!]"
+        conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: If the user approved or asked to implement, you MUST output action: 'commit' WITH the actual code files in files_to_update! Do not just chat about it!]"
 
+    # הנחיות חדות: איסור מוחלט על סיפורים בצ'אט אם המשתמש נתן אישור
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally in Hebrew.
+    
+    CRITICAL ANTI-LAZINESS & EXECUTION RULE:
+    1. If the user approved, gave green light, or asked to implement (e.g. "יש אישור", "בצע", "תממש", "קדימה"):
+       YOU MUST RETURN action: "commit" AND YOU MUST PROVIDE THE ACTUAL CODE in `files_to_update`!
+    2. NEVER just say "It was implemented" or describe the code in chat without providing the actual files to commit. Talking without code is an error!
     
     CRITICAL MEMORY & PROTOCOL RULES:
     1. Always read `summery_for_AI.md` to understand current architecture and progress.
     2. Whenever performing action "commit", you MUST ALWAYS include `summery_for_AI.md` inside `files_to_update` with an updated progress/tasks section documenting what you just implemented!
     
-    CRITICAL WORKFLOW RULES:
-    1. Output a JSON object with your action, commit_message, branch_name, and files_to_update.
-    2. In `chat_response`, provide a clear, detailed and helpful summary in Hebrew of what you did.
-    3. Action Types:
-       - "chat": For answering questions, explanations, or showing code snippets.
-       - "commit": When asked to write code, modify files, or implement a feature in the repo.
+    Action Types:
+    - "chat": ONLY for answering questions or discussions when no code execution was requested.
+    - "commit": When asked to write code, modify files, or when approval was given.
     """
 
     try:
@@ -423,7 +416,6 @@ def main():
     chat_reply = response_data.get("chat_response", "הפעולה בוצעה בהצלחה.")
     files_to_update = response_data.get("files_to_update", [])
 
-    # אם יש קבצים לעדכון – זו פעולת קומיט בוודאות!
     if files_to_update:
         action = "commit"
 

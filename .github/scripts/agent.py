@@ -9,10 +9,9 @@ import time
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 def extract_json(raw_text):
-    """מחלץ אובייקט JSON נקי ובטוח ללא פגיעה בקוד Kotlin/Java."""
+    """מחלץ אובייקט JSON נקי ובטוח ללא פגיעה בקוד."""
     text = raw_text.strip()
     
-    # 1. חילוץ מתוך בלוק Markdown אם יש
     match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
     if match:
         text = match.group(1).strip()
@@ -23,10 +22,8 @@ def extract_json(raw_text):
             text = text[start:end + 1]
             
     try:
-        # strict=False מאפשר שורות חדשות ורווחים בקוד בצורה חוקית
         return json.loads(text, strict=False)
     except Exception:
-        # רשת ביטחון במקרה קיצוני של כישלון
         safe_text = json.dumps(raw_text)
         return json.loads(f'{{"action": "chat", "chat_response": {safe_text}}}', strict=False)
 
@@ -331,17 +328,21 @@ def main():
     if conversation and conversation[-1]["role"] == "user":
         conversation[-1]["parts"][0]["text"] += "\n\n[CRITICAL REMINDER: You MUST output ONLY a valid JSON. You MUST escape all double quotes (\\\") inside code strings!]"
 
+    # הנחיות זיכרון מחודדות שמחייבות עדכון summery_for_AI.md בכל קומיט!
     system_instruction = f"""
     You are an autonomous AI software engineer operating inside this GitHub repository (Default branch: {default_branch}).
     You communicate naturally in Hebrew.
     
-    1. ALWAYS return a perfectly VALID JSON object.
-    2. NEVER return raw text or YAML outside the JSON structure.
-    3. If committing code, ONLY include the files you are modifying or creating in `files_to_update`. 
+    CRITICAL MEMORY & PROTOCOL RULES:
+    1. Always read `summery_for_AI.md` to understand current architecture and progress.
+    2. Whenever performing action "commit", you MUST ALWAYS include `summery_for_AI.md` inside `files_to_update` with an updated progress/tasks section documenting what you just implemented!
     
-    Action Types:
-    - "chat": For answering questions, explanations, or snippets.
-    - "commit": ONLY when asked to write code/modify files in the repo.
+    CRITICAL WORKFLOW RULES:
+    1. ALWAYS return a perfectly VALID JSON object.
+    2. In `chat_response`, provide a clear, detailed and helpful summary in Hebrew of what you did.
+    3. Action Types:
+       - "chat": For answering questions, explanations, or showing code snippets.
+       - "commit": When asked to write code, modify files, or implement a feature in the repo.
     """
 
     try:
@@ -355,7 +356,7 @@ def main():
         response_data = {"action": "chat", "chat_response": str(response_data)}
         
     action = response_data.get("action", "chat")
-    chat_reply = response_data.get("chat_response", "הפעולה בוצעה.")
+    chat_reply = response_data.get("chat_response", "הפעולה בוצעה בהצלחה.")
 
     if action == "commit":
         try:
